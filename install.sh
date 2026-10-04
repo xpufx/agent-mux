@@ -7,8 +7,8 @@ REAL_HOME="$(getent passwd "$USER" 2>/dev/null | cut -d: -f6)"
 LOCAL_BIN="${REAL_HOME}/.local/bin"
 PROFILES_BASE="${REAL_HOME}/.agy-profiles"
 
-PRIMARY="${1:-oktaya}"
-SECONDARY="${2:-pufaysokt}"
+PRIMARY="${1:-primary}"
+SECONDARY="${2:-secondary}"
 
 echo "==================================================="
 echo "  Installing agent-mux (TypeScript Edition)        "

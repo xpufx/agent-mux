@@ -55,7 +55,7 @@ npm install
 
 Example:
 ```bash
-./install.sh oktaya pufaysokt
+./install.sh primary secondary
 ```
 
 This will:
@@ -75,10 +75,10 @@ Output:
 === agent-mux Provider & Profile Status ===
 
 Provider: Google Antigravity (antigravity)
-  • oktaya [Authenticated]:
+  • primary [Authenticated]:
       - Pool 'gemini': [READY]
       - Pool 'claude': [READY]
-  • pufaysokt [Authenticated]:
+  • secondary [Authenticated]:
       - Pool 'gemini': [LIMIT (25h 20m remaining)]
       - Pool 'claude': [READY]
 ```
@@ -88,7 +88,7 @@ Provider: Google Antigravity (antigravity)
 To actively test server ground truth in an isolated `/tmp` workspace without burning unnecessary tokens or indexing directories:
 
 ```bash
-agent-mux probe antigravity oktaya claude
+agent-mux probe antigravity primary claude
 ```
 
 ## CLI Usage
