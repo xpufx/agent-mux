@@ -142,6 +142,7 @@ function printHelp() {
 Usage:
   agent-mux status [provider]                 View live quota and auth status
   agent-mux probe <provider> [profile] [pool] Actively test live model/server access
+  agent-mux models <provider> [--free]        List models available in CLI (optionally free only)
   agent-mux profile list [provider]           List all configured account profiles
   agent-mux profile add <provider> <name>     Scaffold a new account profile
   agent-mux profile auth <provider> <name>    Launch interactive login for a profile
@@ -464,6 +465,39 @@ async function main() {
       process.exit(1);
     }
     await runProbe(args[1], args[2], args[3]);
+    return;
+  }
+
+  if (cmd === "models") {
+    const provId = args[1];
+    if (!provId) {
+      console.error("Usage: agent-mux models <provider> [--free] [--profile <name>]");
+      process.exit(1);
+    }
+    const prov = getProviderAdapter(provId);
+    if (!prov.listModels) {
+      console.error(`Provider '${prov.displayName}' does not support listing models.`);
+      process.exit(1);
+    }
+    const freeOnly = args.includes("--free");
+    let prof: string | undefined;
+    const profIdx = args.indexOf("--profile");
+    if (profIdx !== -1 && args[profIdx + 1]) {
+      prof = args[profIdx + 1];
+    }
+    const models = await prov.listModels(prof);
+    const filtered = freeOnly
+      ? models.filter((m) => m.toLowerCase().includes("free"))
+      : models;
+
+    console.log(`=== Models for ${prov.displayName}${freeOnly ? " (Free only)" : ""}: ===`);
+    if (filtered.length === 0) {
+      console.log("  (No models found matching criteria)");
+    } else {
+      for (const m of filtered) {
+        console.log(`  • ${m}`);
+      }
+    }
     return;
   }
 

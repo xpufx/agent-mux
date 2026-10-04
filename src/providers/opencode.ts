@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import type { ProviderAdapter, PoolQuota, QuotaState } from "../types.js";
 import { getAgentProfilesDir, getRealHome } from "../core/paths.js";
 import { isQuotaError } from "../core/supervisor.js";
+import { loadConfig } from "../core/config.js";
 
 export class OpenCodeAdapter implements ProviderAdapter {
   id = "opencode";
@@ -153,6 +154,32 @@ export class OpenCodeAdapter implements ProviderAdapter {
     return [{ pool: "default", state: "READY" }];
   }
 
+  async listModels(profile = "primary"): Promise<string[]> {
+    const profDir = path.join(this.profilesBaseDir, profile);
+    const targetHome = fs.existsSync(profDir) ? profDir : getRealHome();
+
+    try {
+      const child = spawnSync(this.defaultBinaryPath, ["models"], {
+        cwd: "/tmp",
+        env: {
+          ...process.env,
+          HOME: targetHome
+        },
+        encoding: "utf-8",
+        timeout: 10000,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      if (child.stdout) {
+        return child.stdout
+          .split("\n")
+          .map((m) => m.trim())
+          .filter(Boolean);
+      }
+    } catch {}
+    return [];
+  }
+
   async probe(
     profile: string,
     pool: string
@@ -166,6 +193,46 @@ export class OpenCodeAdapter implements ProviderAdapter {
       };
     }
 
+    const cfg = loadConfig();
+    const probeModel = (cfg.opencode_probe_model as string) || process.env.OPENCODE_PROBE_MODEL;
+
+    // If an explicit probe model is configured, execute a live 1-turn prompt test
+    if (probeModel) {
+      try {
+        const child = spawnSync(
+          this.defaultBinaryPath,
+          ["run", "--pure", "-m", probeModel, "echo ping"],
+          {
+            cwd: "/tmp",
+            env: {
+              ...process.env,
+              HOME: profDir
+            },
+            encoding: "utf-8",
+            timeout: 20000,
+            stdio: ["ignore", "pipe", "pipe"]
+          }
+        );
+
+        const combined = `${child.stdout || ""} ${child.stderr || ""}`;
+        if (child.status === 0) {
+          return { state: "READY", details: `Verified prompt on ${probeModel}` };
+        }
+
+        if (isQuotaError(combined)) {
+          return { state: "LIMIT", details: `Quota/credit limit on ${probeModel}` };
+        }
+
+        return {
+          state: "LIMIT",
+          details: child.stderr?.trim() || `Exit code ${child.status} on ${probeModel}`
+        };
+      } catch (err: any) {
+        return { state: "UNKNOWN", details: err.message || `Probe failed on ${probeModel}` };
+      }
+    }
+
+    // Default fast validation: check local auth credentials and CLI model catalog
     try {
       const child = spawnSync(this.defaultBinaryPath, ["models"], {
         cwd: "/tmp",
@@ -180,7 +247,10 @@ export class OpenCodeAdapter implements ProviderAdapter {
 
       if (child.status === 0 && child.stdout && child.stdout.trim().length > 0) {
         const modelCount = child.stdout.split("\n").filter(Boolean).length;
-        return { state: "READY", details: `Verified (${modelCount} models available)` };
+        return {
+          state: "READY",
+          details: `Authenticated (${modelCount} CLI models available; configure opencode_probe_model for inference probe)`
+        };
       }
 
       const combined = `${child.stdout || ""} ${child.stderr || ""}`;

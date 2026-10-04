@@ -225,4 +225,15 @@ export class AntigravityAdapter implements ProviderAdapter {
       return { state: "UNKNOWN", details: err.message || "Probe failed" };
     }
   }
+
+  async listModels(): Promise<string[]> {
+    return [
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "gemini-3.8-flash-low",
+      "claude-sonnet-4-6",
+      "claude-sonnet-5-5-low",
+      "claude-opus-4-6"
+    ];
+  }
 }
