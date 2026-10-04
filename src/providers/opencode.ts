@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import type { ProviderAdapter, PoolQuota, QuotaState } from "../types.js";
-import { getAgentProfilesDir } from "../core/paths.js";
+import { getAgentProfilesDir, getRealHome } from "../core/paths.js";
 import { isQuotaError } from "../core/supervisor.js";
 
 export class OpenCodeAdapter implements ProviderAdapter {
@@ -101,5 +102,49 @@ export class OpenCodeAdapter implements ProviderAdapter {
     } catch {}
 
     return pools;
+  }
+
+  async probe(
+    profile: string,
+    pool: string
+  ): Promise<{ state: QuotaState; details: string }> {
+    const profDir = path.join(this.profilesBaseDir, profile);
+    const hasAuth = await this.getAuthStatus(profile);
+    if (!hasAuth) {
+      return {
+        state: "LIMIT",
+        details: "Pending authentication (missing or empty auth.json)"
+      };
+    }
+
+    try {
+      const child = spawnSync(this.defaultBinaryPath, ["models"], {
+        cwd: "/tmp",
+        env: {
+          ...process.env,
+          HOME: profDir
+        },
+        encoding: "utf-8",
+        timeout: 10000,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      if (child.status === 0 && child.stdout && child.stdout.trim().length > 0) {
+        const modelCount = child.stdout.split("\n").filter(Boolean).length;
+        return { state: "READY", details: `Verified (${modelCount} models available)` };
+      }
+
+      const combined = `${child.stdout || ""} ${child.stderr || ""}`;
+      if (isQuotaError(combined)) {
+        return { state: "LIMIT", details: "Rate limit detected" };
+      }
+
+      return {
+        state: "UNKNOWN",
+        details: child.stderr?.trim() || `Exit code ${child.status}`
+      };
+    } catch (err: any) {
+      return { state: "UNKNOWN", details: err.message || "Probe failed" };
+    }
   }
 }

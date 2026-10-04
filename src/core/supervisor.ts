@@ -331,6 +331,6 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       });
     }
 
-    attachStdoutListener(child);
+    attachStdoutListener(child!);
   });
 }
