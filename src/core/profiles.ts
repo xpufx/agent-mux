@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getRealHome, COMMON_DOTFILES } from "./paths.js";
+import { checkCooldown } from "./state.js";
 import type { ProviderAdapter, ProfileStatus } from "../types.js";
 
 export function listProfiles(adapter: ProviderAdapter): string[] {
@@ -69,6 +70,19 @@ export async function getProviderStatus(adapter: ProviderAdapter): Promise<Profi
       ? await adapter.getAccountIdentity(prof)
       : undefined;
     const pools = await adapter.getQuotaStatus(prof);
+
+    // Overlay active persistent cooldowns if present
+    for (const p of pools) {
+      const cd = checkCooldown(adapter.id, prof, p.pool);
+      if (cd.cooling && cd.remainingSec !== undefined) {
+        p.state = "LIMIT";
+        p.remainingSeconds = cd.remainingSec;
+        const h = Math.floor(cd.remainingSec / 3600);
+        const min = Math.floor((cd.remainingSec % 3600) / 60);
+        p.details = `${h}h ${min}m remaining`;
+      }
+    }
+
     results.push({
       profile: prof,
       authenticated,
