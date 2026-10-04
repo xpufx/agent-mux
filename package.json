@@ -1,0 +1,33 @@
+{
+  "name": "agent-mux",
+  "version": "0.1.0",
+  "description": "High-availability multi-account multiplexer and stream supervisor for AI coding agent CLIs",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "agent-mux": "./dist/cli.js",
+    "agy-mux": "./dist/wrappers/agy.js",
+    "opencode-mux": "./dist/wrappers/opencode.js"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "keywords": [
+    "antigravity",
+    "opencode",
+    "paseo",
+    "agent",
+    "multiplexer",
+    "quota",
+    "supervisor"
+  ],
+  "author": "xpufx",
+  "license": "GPL-3.0",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

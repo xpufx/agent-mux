@@ -3,7 +3,7 @@ set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAL_HOME="$(getent passwd "$USER" 2>/dev/null | cut -d: -f6)"
-[[ -z "$REAL_HOME" ]] && REAL_HOME="${HOME%%/.agy-profiles*}"
+[[ -z "$REAL_HOME" ]] && REAL_HOME="${HOME%%/.ag*}"
 LOCAL_BIN="${REAL_HOME}/.local/bin"
 PROFILES_BASE="${REAL_HOME}/.agy-profiles"
 
@@ -11,16 +11,20 @@ PRIMARY="${1:-oktaya}"
 SECONDARY="${2:-pufaysokt}"
 
 echo "==================================================="
-echo "  Installing Antigravity (agy) Multi-Account Relay "
+echo "  Installing agent-mux (TypeScript Edition)        "
 echo "==================================================="
 echo "Primary profile  : $PRIMARY"
 echo "Secondary profile: $SECONDARY"
-echo "Target directory : $PROFILES_BASE"
+echo "Profiles base    : $PROFILES_BASE"
 echo ""
+
+# 1. Build TypeScript dist binaries
+echo "[+] Building TypeScript binaries..."
+(cd "$DIR" && npm run build)
 
 mkdir -p "$LOCAL_BIN" "$PROFILES_BASE/$PRIMARY" "$PROFILES_BASE/$SECONDARY/.gemini/antigravity-cli"
 
-# 1. Back up and link real agy binary
+# 2. Back up and link real agy binary
 TARGET_AGY="$LOCAL_BIN/agy"
 REAL_AGY="$LOCAL_BIN/agy.bin"
 
@@ -36,27 +40,20 @@ if [[ ! -f "$REAL_AGY" ]]; then
   if [[ -n "$SYS_AGY" && -f "$SYS_AGY" ]]; then
     echo "[+] Copying system agy binary from $SYS_AGY to $REAL_AGY..."
     cp -p "$SYS_AGY" "$REAL_AGY"
-  else
-    echo "[-] Error: Could not locate real agy binary. Please install agy first."
-    exit 1
   fi
 fi
 
-# 2. Configure Profile Symlinks and Shared Storage
+# 3. Configure Profile Symlinks and Shared Storage for Antigravity
 echo "[+] Configuring profiles and sharing conversation history..."
-
-# Setup Primary
 ln -sfn "$REAL_HOME/.gemini" "$PROFILES_BASE/$PRIMARY/.gemini"
 for dot in .gitconfig .git-credentials .ssh .local .config .bashrc .profile .agents; do
   [[ -e "$REAL_HOME/$dot" ]] && ln -sfn "$REAL_HOME/$dot" "$PROFILES_BASE/$PRIMARY/$dot"
 done
 
-# Setup Secondary
 [[ -f "$REAL_HOME/.gemini/antigravity-cli/settings.json" ]] && \
   cp -n "$REAL_HOME/.gemini/antigravity-cli/settings.json" "$PROFILES_BASE/$SECONDARY/.gemini/antigravity-cli/settings.json" 2>/dev/null || true
 ln -sfn "$REAL_HOME/.gemini/config" "$PROFILES_BASE/$SECONDARY/.gemini/config"
 
-# Share conversation trajectory DBs between both accounts
 mkdir -p "$REAL_HOME/.gemini/antigravity-cli/conversations"
 if [[ ! -L "$PROFILES_BASE/$SECONDARY/.gemini/antigravity-cli/conversations" ]]; then
   rm -rf "$PROFILES_BASE/$SECONDARY/.gemini/antigravity-cli/conversations"
@@ -67,56 +64,18 @@ for dot in .gitconfig .git-credentials .ssh .local .config .bashrc .profile .age
   [[ -e "$REAL_HOME/$dot" ]] && ln -sfn "$REAL_HOME/$dot" "$PROFILES_BASE/$SECONDARY/$dot"
 done
 
-# 3. Install Wrapper Binaries
-echo "[+] Installing CLI wrapper and supervisor into $LOCAL_BIN..."
-cp -p "$DIR/bin/agy-supervisor.py" "$LOCAL_BIN/agy-supervisor.py"
-cp -p "$DIR/bin/agy-profile" "$LOCAL_BIN/agy-profile"
-cp -p "$DIR/bin/agy" "$LOCAL_BIN/agy"
+# 4. Install agent-mux binaries into ~/.local/bin
+echo "[+] Installing binaries into $LOCAL_BIN..."
+cp -p "$DIR/dist/cli.js" "$LOCAL_BIN/agent-mux"
+cp -p "$DIR/dist/wrappers/agy.js" "$LOCAL_BIN/agy"
+cp -p "$DIR/dist/wrappers/opencode.js" "$LOCAL_BIN/opencode-mux"
 
-chmod +x "$LOCAL_BIN/agy" "$LOCAL_BIN/agy-profile" "$LOCAL_BIN/agy-supervisor.py"
+chmod +x "$LOCAL_BIN/agent-mux" "$LOCAL_BIN/agy" "$LOCAL_BIN/opencode-mux"
 
-# Convenience symlinks
-ln -sfn "$LOCAL_BIN/agy-profile" "$LOCAL_BIN/agy-oktaya"
-ln -sfn "$LOCAL_BIN/agy-profile" "$LOCAL_BIN/agy-pufaysokt"
-ln -sfn "$LOCAL_BIN/agy-profile" "$LOCAL_BIN/agy-rr"
-ln -sfn "$LOCAL_BIN/agy-profile" "$LOCAL_BIN/agy-auto"
-
-# 4. Configure Paseo Plugin (if Paseo is installed)
-PASEO_CONFIG="${REAL_HOME}/.paseo/config.json"
-PASEO_PLUGINS_DIR="${REAL_HOME}/code/paseo/plugins"
-if [[ -f "$PASEO_CONFIG" ]]; then
-  echo "[+] Configuring Paseo plugin for antigravity-claude..."
-  # The plugin now lives in the paseo repo (plugins/antigravity-claude).
-  if [[ ! -d "$PASEO_PLUGINS_DIR/antigravity-claude" ]]; then
-    echo "[-] Notice: $PASEO_PLUGINS_DIR/antigravity-claude not found; pull the paseo repo to get the plugin."
-  else
-  # Register plugin in config.json if not present
-  python3 -c "
-import json
-config_path = '${PASEO_CONFIG}'
-try:
-    with open(config_path, 'r') as f:
-        data = json.load(f)
-    if 'plugins' not in data:
-        data['plugins'] = {}
-    if 'antigravity-claude' not in data['plugins']:
-        data['plugins']['antigravity-claude'] = {
-            'source': 'directory',
-            'path': '${PASEO_PLUGINS_DIR}/antigravity-claude',
-            'enabled': True
-        }
-        with open(config_path, 'w') as f:
-            json.dump(data, f, indent=2)
-        print('[+] Registered antigravity-claude plugin in Paseo config.')
-    else:
-        print('[+] antigravity-claude plugin already registered in Paseo config.')
-except Exception as e:
-    print(f'[-] Notice: Could not update Paseo config: {e}')
-"
-  fi
-fi
+# Convenience shortcuts
+ln -sfn "$LOCAL_BIN/agent-mux" "$LOCAL_BIN/agy-profile"
 
 echo ""
 echo "=== Installation Complete! ==="
-echo "Status check:"
-"$LOCAL_BIN/agy-profile" status
+echo "Live status:"
+"$LOCAL_BIN/agent-mux" status
