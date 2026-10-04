@@ -124,7 +124,7 @@ Provider: OpenCode (opencode)
       - Pool 'default': [READY]
 ```
 
-### 3. Active Server Probe
+### 3. Active Server Probe & Model Discovery
 
 Verify connectivity and model access live in seconds:
 
@@ -132,8 +132,17 @@ Verify connectivity and model access live in seconds:
 # Probe Antigravity Claude pool on primary account
 agent-mux probe antigravity primary claude
 
-# Probe OpenCode models across all profiles
+# Probe OpenCode models across all profiles (pure execution, zero MCP/plugin cruft)
 agent-mux probe opencode
+
+# Configure a specific model to probe for OpenCode inference testing
+agent-mux config set opencode_probe_model "opencode/fledge-alpha-free"
+
+# List all available models discovered in the CLI environment
+agent-mux models opencode
+
+# List only free models
+agent-mux models opencode --free
 ```
 
 ---
