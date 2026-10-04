@@ -148,41 +148,9 @@ export class OpenCodeAdapter implements ProviderAdapter {
   }
 
   async getQuotaStatus(profile: string): Promise<PoolQuota[]> {
-    const logDir = path.join(
-      this.profilesBaseDir,
-      profile,
-      ".local/share/opencode/log"
-    );
-    const pools: PoolQuota[] = [{ pool: "default", state: "READY" }];
-
-    if (!fs.existsSync(logDir)) {
-      return pools;
-    }
-
-    try {
-      const logs = fs
-        .readdirSync(logDir)
-        .map((f) => path.join(logDir, f))
-        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-
-      const now = Date.now();
-      for (const logFile of logs.slice(0, 5)) {
-        const stats = fs.statSync(logFile);
-        if (now - stats.mtimeMs > 3600 * 1000) continue;
-
-        const content = fs.readFileSync(logFile, "utf-8");
-        if (isQuotaError(content)) {
-          pools[0] = {
-            pool: "default",
-            state: "LIMIT",
-            details: "Recent rate limit in logs"
-          };
-          break;
-        }
-      }
-    } catch {}
-
-    return pools;
+    // Quota state is tracked deterministically via live turn supervision
+    // and persisted cooldowns in ~/.agent-mux/state/cooldowns.json, eliminating disk log pollution.
+    return [{ pool: "default", state: "READY" }];
   }
 
   async probe(
