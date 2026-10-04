@@ -4,6 +4,8 @@ import path from "node:path";
 import type { ProviderAdapter } from "../types.js";
 import { listProfiles, ensureProfile } from "./profiles.js";
 import { getSurfaceAccountMode, type SurfaceAccountMode } from "./config.js";
+import { recordCooldown } from "./state.js";
+import { selectProfile } from "./router.js";
 
 export function isQuotaError(text: unknown): boolean {
   if (!text) return false;
@@ -16,6 +18,21 @@ export function isQuotaError(text: unknown): boolean {
     t.includes("quota exceeded") ||
     t.includes("rate_limit")
   );
+}
+
+export function parseResetDurationSeconds(text: string): number {
+  const m = text.match(/Resets in ([^\.]+)/);
+  if (m) {
+    const hours = m[1].match(/(\d+)\s*h/);
+    const mins = m[1].match(/(\d+)\s*m/);
+    const secs = m[1].match(/(\d+)\s*s/);
+    let total = 0;
+    if (hours) total += parseInt(hours[1], 10) * 3600;
+    if (mins) total += parseInt(mins[1], 10) * 60;
+    if (secs) total += parseInt(secs[1], 10);
+    if (total > 0) return total;
+  }
+  return 3600; // default 1h
 }
 
 export interface SupervisorOptions {
@@ -72,7 +89,7 @@ export function buildAccountToolFrame(
 export async function runSupervisor(options: SupervisorOptions): Promise<number> {
   const { adapter, binaryPath, args } = options;
   const surfaceMode = options.surfaceAccount ?? getSurfaceAccountMode();
-  const profiles = listProfiles(adapter);
+  const targetPool = adapter.resolveTargetPool(args, options.env || process.env);
   let currentProfile = options.initialProfile;
   let conversationId: string | null = null;
 
@@ -83,23 +100,19 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     }
   }
 
-  function getFallbackProfile(current: string): string {
-    const idx = profiles.indexOf(current);
-    if (idx === -1 || profiles.length <= 1) return current;
-    return profiles[(idx + 1) % profiles.length];
-  }
-
   let child: ChildProcess | null = null;
   let lastUserMessage: string | null = null;
   const recentStderr: string[] = [];
   let isRelaunching = false;
   let relaunchCount = 0;
+  const triedProfiles = new Set<string>([currentProfile]);
 
-  // Turn surfacing state
+  // Turn state
   let turnSurfaced = false;
   let turnMessagePrefixed = false;
   let hadFailover = false;
   let failoverPrevProfile: string | null = null;
+  let turnHadOutput = false;
 
   function injectAccountFrame(isFailover = false, prevProfile?: string) {
     if (surfaceMode !== "tool" && surfaceMode !== "both") return;
@@ -155,7 +168,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         lastUserMessage = line;
         turnSurfaced = false;
         turnMessagePrefixed = false;
+        turnHadOutput = false;
         relaunchCount = 0;
+        triedProfiles.clear();
+        triedProfiles.add(currentProfile);
       }
     } catch {}
 
@@ -183,9 +199,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     function attachStdoutListener(proc: ChildProcess) {
       const rl = readline.createInterface({ input: proc.stdout! });
 
-      rl.on("line", (line) => {
+      rl.on("line", async (line) => {
         let quotaDetected = false;
         let parsedFrame: any = null;
+        let errorDetails = "";
 
         try {
           parsedFrame = JSON.parse(line);
@@ -197,29 +214,41 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             }
           }
 
+          if (eventType === "step_update") {
+            const su = parsedFrame.step_update;
+            if (su && (su.step_type === "agent_response" || su.step_type === "tool")) {
+              turnHadOutput = true;
+            }
+          }
+
           if (eventType === "result") {
             const res = parsedFrame.result || {};
             if (res.status === "ERROR" && isQuotaError(res.error)) {
               quotaDetected = true;
+              errorDetails = String(res.error);
             } else {
               lastUserMessage = null;
               turnSurfaced = false;
               turnMessagePrefixed = false;
+              turnHadOutput = false;
               hadFailover = false;
               failoverPrevProfile = null;
               relaunchCount = 0;
+              triedProfiles.clear();
             }
           } else if (eventType === "error" && isQuotaError(parsedFrame.error)) {
             quotaDetected = true;
+            errorDetails = String(parsedFrame.error);
           }
         } catch {
           if (isQuotaError(line)) {
             quotaDetected = true;
+            errorDetails = line;
           }
         }
 
         if (quotaDetected) {
-          handleRelaunch("Quota exhausted");
+          await handleRelaunch("Quota exhausted", errorDetails, line);
           return;
         }
 
@@ -254,12 +283,13 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         process.stdout.write(line + "\n");
       });
 
-      proc.on("close", (code) => {
+      proc.on("close", async (code) => {
         if (isRelaunching) return;
 
         // Check if process crashed due to quota error during active turn
-        if (lastUserMessage && recentStderr.some((err) => isQuotaError(err))) {
-          handleRelaunch("Process exited with quota limit");
+        const errLine = recentStderr.find((err) => isQuotaError(err));
+        if (lastUserMessage && errLine) {
+          await handleRelaunch("Process exited with quota limit", errLine);
           return;
         }
 
@@ -269,13 +299,33 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       });
     }
 
-    function handleRelaunch(reason: string) {
+    async function handleRelaunch(
+      reason: string,
+      errorDetails?: string,
+      rawErrorLine?: string
+    ) {
       if (isRelaunching) return;
 
-      if (relaunchCount >= profiles.length) {
+      const durSec = parseResetDurationSeconds(errorDetails || "");
+      recordCooldown(adapter.id, currentProfile, targetPool, durSec, errorDetails || reason);
+
+      // Check if a healthy fallback exists
+      const decision = await selectProfile(
+        adapter,
+        args,
+        options.env || process.env,
+        "auto",
+        Array.from(triedProfiles)
+      );
+
+      // If all candidates are in cooldown or already tried, STOP. Do not flap!
+      if (decision.allCooldown || triedProfiles.has(decision.profile)) {
         process.stderr.write(
-          `\n[agent-mux] All available profiles exhausted quota. Passing failure upstream.\n`
+          `\n[agent-mux] ${reason} on ${currentProfile} (pool: ${targetPool}). All candidate profiles are exhausted. Halting failover.\n`
         );
+        if (rawErrorLine) {
+          process.stdout.write(rawErrorLine + "\n");
+        }
         return;
       }
 
@@ -283,9 +333,11 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       relaunchCount++;
 
       const prevProf = currentProfile;
-      const nextProf = getFallbackProfile(currentProfile);
+      const nextProf = decision.profile;
+      triedProfiles.add(nextProf);
+
       process.stderr.write(
-        `\n[agent-mux] ${reason} on ${prevProf}. Automatically switching to ${nextProf}...\n`
+        `\n[agent-mux] ${reason} on ${prevProf} (pool: ${targetPool}). Automatically switching to healthy profile: ${nextProf}...\n`
       );
 
       // Kill previous child
@@ -318,8 +370,8 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               turnSurfaced = false;
               rl.close();
 
-              // Re-send last user message
-              if (lastUserMessage && newChild.stdin && !newChild.stdin.destroyed) {
+              // Only re-send last user message if previous turn had not produced output
+              if (!turnHadOutput && lastUserMessage && newChild.stdin && !newChild.stdin.destroyed) {
                 newChild.stdin.write(lastUserMessage + "\n");
               }
 
