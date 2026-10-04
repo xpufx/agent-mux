@@ -127,7 +127,7 @@ import {
   clearAllCooldowns,
   clearCooldown
 } from "../core/state.js";
-import { ensureProfile } from "../core/profiles.js";
+import { ensureProfile, removeProfile } from "../core/profiles.js";
 
 function printHelp() {
   console.log(`agent-mux - Multi-Account Multiplexer and Stream Supervisor
@@ -138,6 +138,7 @@ Usage:
   agent-mux profile list [provider]           List all configured account profiles
   agent-mux profile add <provider> <name>     Scaffold a new account profile
   agent-mux profile auth <provider> <name>    Launch interactive login for a profile
+  agent-mux profile remove <provider> <name>  Delete an account profile
   agent-mux cooldowns [list]                  View active cooldown locks and reset times
   agent-mux cooldowns clear [provider]        Clear persistent cooldown locks
   agent-mux config [list|get|set]             Manage global configuration
@@ -169,6 +170,18 @@ Environment Variables:
 
 async function handleProfileCommand(args: string[]) {
   const sub = args[0] || "list";
+
+  if (sub === "--help" || sub === "-h" || sub === "help") {
+    console.log(`Usage: agent-mux profile <action> [options]
+
+Actions:
+  list [provider]                  List configured account profiles
+  add <provider> <name>            Scaffold a new account profile
+  auth <provider> <name>           Launch interactive login for a profile
+  remove <provider> <name>         Delete an account profile (aliases: rm, delete)
+`);
+    return;
+  }
 
   if (sub === "list") {
     const providerId = args[1];
@@ -245,12 +258,39 @@ async function handleProfileCommand(args: string[]) {
     return;
   }
 
-  console.error(`Unknown profile action: ${sub}. Available actions: list, add, auth`);
+  if (sub === "remove" || sub === "delete" || sub === "rm") {
+    const provId = args[1];
+    const profName = args[2];
+    if (!provId || !profName) {
+      console.error("Usage: agent-mux profile remove <provider> <profile-name>");
+      process.exit(1);
+    }
+    const adapter = getProviderAdapter(provId);
+    const removed = removeProfile(adapter, profName);
+    if (removed) {
+      console.log(`\x1b[32m[✓] Profile '${profName}' removed successfully from ${adapter.displayName}.\x1b[0m`);
+    } else {
+      console.log(`\x1b[33m[!] Profile '${profName}' does not exist for ${adapter.displayName}.\x1b[0m`);
+    }
+    return;
+  }
+
+  console.error(`Unknown profile action: ${sub}. Available actions: list, add, auth, remove`);
   process.exit(1);
 }
 
 function handleCooldownsCommand(args: string[]) {
   const sub = args[0] || "list";
+
+  if (sub === "--help" || sub === "-h" || sub === "help") {
+    console.log(`Usage: agent-mux cooldowns <action> [options]
+
+Actions:
+  list                                          View active cooldown locks and reset times
+  clear [provider] [profile] [pool]             Clear all or specific persistent cooldown locks
+`);
+    return;
+  }
 
   if (sub === "list") {
     const cooldowns = loadCooldowns();

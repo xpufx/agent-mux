@@ -50,6 +50,15 @@ export function ensureProfile(adapter: ProviderAdapter, profile: string): string
   return profileDir;
 }
 
+export function removeProfile(adapter: ProviderAdapter, profile: string): boolean {
+  const profileDir = path.join(adapter.profilesBaseDir, profile);
+  if (!fs.existsSync(profileDir)) return false;
+
+  // Cleanly remove the profile directory
+  fs.rmSync(profileDir, { recursive: true, force: true });
+  return true;
+}
+
 export async function getProviderStatus(adapter: ProviderAdapter): Promise<ProfileStatus[]> {
   const profiles = listProfiles(adapter);
   const results: ProfileStatus[] = [];

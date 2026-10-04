@@ -170,6 +170,9 @@ agent-mux profile add antigravity tertiary
 
 # Interactively log in to an account profile
 agent-mux profile auth antigravity tertiary
+
+# Remove / delete an account profile
+agent-mux profile remove antigravity tertiary
 ```
 
 ---
