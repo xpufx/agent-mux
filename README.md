@@ -107,15 +107,21 @@ agent-mux status
 
 Output:
 ```text
-=== agent-mux Provider & Profile Status ===
+=== agent-mux Provider & Profile Status [Isolation Mode: home] ===
 
 Provider: Google Antigravity (antigravity)
-  • primary [Authenticated]:
+  • primary [Authenticated] (primary@example.com):
       - Pool 'gemini': [READY]
       - Pool 'claude': [READY]
-  • secondary [Authenticated]:
+  • secondary [Authenticated] (secondary@example.com):
       - Pool 'gemini': [READY]
-      - Pool 'claude': [LIMIT (155h 15m remaining)]
+      - Pool 'claude': [LIMIT (154h 10m remaining)]
+
+Provider: OpenCode (opencode)
+  • primary [Authenticated] (opencode-go (oc_sk_8c...FeX7)):
+      - Pool 'default': [READY]
+  • secondary [Authenticated] (opencode-go (oc_sk_84...tqV7)):
+      - Pool 'default': [READY]
 ```
 
 ### 3. Active Server Probe
@@ -180,7 +186,24 @@ Manage and authenticate isolated provider accounts:
 ```bash
 # List all configured accounts and authentication state
 agent-mux profile list
+```
 
+Output:
+```text
+=== Configured Account Profiles [Isolation Mode: home] ===
+
+Provider: Google Antigravity (antigravity)
+Base directory: ~/.agent-mux/profiles/antigravity
+  • primary          [Authenticated] (primary@example.com) -> ~/.agent-mux/profiles/antigravity/primary
+  • secondary        [Authenticated] (secondary@example.com) -> ~/.agent-mux/profiles/antigravity/secondary
+
+Provider: OpenCode (opencode)
+Base directory: ~/.agent-mux/profiles/opencode
+  • primary          [Authenticated] (opencode-go (oc_sk_8c...FeX7)) -> ~/.agent-mux/profiles/opencode/primary
+  • secondary        [Authenticated] (opencode-go (oc_sk_84...tqV7)) -> ~/.agent-mux/profiles/opencode/secondary
+```
+
+```bash
 # Scaffold a new account profile (symlinks dotfiles and trajectories)
 agent-mux profile add antigravity tertiary
 
