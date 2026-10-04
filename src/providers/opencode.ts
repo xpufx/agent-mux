@@ -201,7 +201,7 @@ export class OpenCodeAdapter implements ProviderAdapter {
       try {
         const child = spawnSync(
           this.defaultBinaryPath,
-          ["run", "--pure", "-m", probeModel, "echo ping"],
+          ["run", "--pure", "--dir", "/tmp", "--format", "json", "-m", probeModel, "ping"],
           {
             cwd: "/tmp",
             env: {
@@ -209,14 +209,18 @@ export class OpenCodeAdapter implements ProviderAdapter {
               HOME: profDir
             },
             encoding: "utf-8",
-            timeout: 20000,
+            timeout: 25000,
             stdio: ["ignore", "pipe", "pipe"]
           }
         );
 
         const combined = `${child.stdout || ""} ${child.stderr || ""}`;
         if (child.status === 0) {
-          return { state: "READY", details: `Verified prompt on ${probeModel}` };
+          // Check for successful text response
+          const stdout = child.stdout || "";
+          if (stdout.includes('"type":"text"') || stdout.includes('"type":"step_finish"')) {
+            return { state: "READY", details: `Verified prompt on ${probeModel}` };
+          }
         }
 
         if (isQuotaError(combined)) {
