@@ -14,6 +14,11 @@ if [[ -f "$REAL_AGY" ]]; then
   mv -f "$REAL_AGY" "$TARGET_AGY"
 fi
 
+if [[ -L "$LOCAL_BIN/opencode" ]]; then
+  echo "[+] Removing opencode wrapper symlink..."
+  rm -f "$LOCAL_BIN/opencode"
+fi
+
 rm -f "$LOCAL_BIN/agent-mux" \
       "$LOCAL_BIN/opencode-mux" \
       "$LOCAL_BIN/agy-profile" \

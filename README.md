@@ -1,63 +1,81 @@
 # agent-mux
 
-High-availability multi-account multiplexer and stream supervisor for AI coding agent CLIs.
+High-availability multi-account multiplexer, smart router, and stream supervisor for AI coding agent CLIs.
 
 ## Overview
 
 Agent CLIs such as Google Antigravity (`agy`) and OpenCode enforce rolling token limits or rate limits per account. When driven by autonomous agent frameworks like Paseo, hitting a rate limit or HTTP 429 mid-turn terminates or stalls the agent session.
 
 `agent-mux` provides:
-1. Environment isolation: Each account has an isolated `$HOME` directory under `~/.agent-mux/profiles/<provider>/<account>` so local configurations, credentials, and state caches never conflict.
-2. Configurable location: The base directory defaults to `~/.agent-mux`, but can be overridden by setting the `AGENT_MUX_HOME` environment variable.
-3. Arbitrary N accounts: Support for 2, 3, 5, or more accounts per provider with automatic sequential quota fallback and round-robin scheduling.
-4. Shared session history: Trajectory databases (e.g. SQLite conversation stores) and global developer dotfiles (`.gitconfig`, `.ssh`, `.agents`) are symlinked across profiles so context is preserved.
-5. Stream supervision: When launched in streaming mode (such as Paseo's `stream-json`), `agent-mux` monitors the NDJSON stream. If an account encounters `RESOURCE_EXHAUSTED` or a rate limit mid-turn, the supervisor terminates the exhausted process, switches `$HOME` to the fallback account, resumes the exact conversation ID, and resends the pending prompt transparently.
-6. Quota pool awareness: Tracks separate quota pools (e.g. Gemini tokens vs Claude/Partner tokens in Antigravity) without burning tokens on status checks.
+1. **Environment Isolation**: Each account has an isolated `$HOME` directory under `~/.agent-mux/profiles/<provider>/<account>` so local configurations, credentials, and state caches never conflict.
+2. **Configurable Base**: Defaults to `~/.agent-mux`, configurable via the `AGENT_MUX_HOME` environment variable.
+3. **Arbitrary $N$ Accounts**: Scale beyond 2 accounts to 3, 5, or more per provider with automatic sequential fallback and round-robin scheduling.
+4. **Shared Session History**: Trajectory databases (e.g. SQLite conversation stores) and developer dotfiles (`.gitconfig`, `.ssh`, `.agents`) are symlinked across profiles so project context is preserved.
+5. **Persistent Cooldown State**: Rate limits and quota exhaustion timestamps are tracked persistently in `~/.agent-mux/state/cooldowns.json` per `(provider, profile, pool)`. Accounts in cooldown are skipped immediately without attempting doomed turns.
+6. **Anti-Flapping Circuit Breaker**: If all accounts for a requested model/pool are exhausted, the supervisor halts immediately and surfaces the error upstream. It avoids mid-turn kills, duplicate prompt replay, or infinite flapping loops.
+7. **Quota Pool & Model Awareness**: Separates quota tracking by pool (e.g. Gemini vs Claude/Partner in Antigravity) so an exhausted Claude quota does not block Gemini tasks.
+8. **Active Server Probing**: High-speed, non-interactive verification (`agent-mux probe`) that tests server ground truth in seconds with zero terminal or TTY suspension.
+9. **Flexible Configuration**: Stored in `~/.agent-mux/config.json` with live CLI management via `agent-mux config`.
+
+---
 
 ## Architecture
 
 ```text
-Clients (Paseo, Terminal)
+Clients (Paseo, Terminal, Automation)
         │
         ▼
    agent-mux (Smart Router)
         │
-        ├── Checks quota across all configured profiles (1..N)
+        ├── Reads persistent cooldown state (~/.agent-mux/state/cooldowns.json)
+        ├── Inspects live quota and auth status across profiles (1..N)
+        ├── Filters candidates matching requested pool/model
         │
         ▼
    Stream Supervisor (for stream-json sessions)
         │
-        ├── Account 1 (active child process)
+        ├── Spawns Active Profile (Child Process)
         │     │
-        │     └── If 429 / RESOURCE_EXHAUSTED detected:
-        │           Terminates Account 1
-        │           Swaps HOME to next ready Account (2..N)
-        │           Replays prompt on same conversation ID
+        │     ├── If 429 / RESOURCE_EXHAUSTED occurs:
+        │     │     1. Records cooldown with reset timestamp to disk
+        │     │     2. Queries router for healthy fallback candidate
+        │     │     3. If all candidates exhausted: HALTS immediately (no flapping)
+        │     │     4. If healthy candidate exists: switches HOME & replays turn
+        │     ▼
         ▼
-   Shared SQLite Trajectory Store (~/.gemini/.../conversations/*.db)
+   Shared Trajectory Store (~/.gemini/.../conversations/*.db, ~/.local/share/opencode)
 ```
+
+---
 
 ## Directory Structure
 
 ```text
 ~/.agent-mux/                           # Configurable via $AGENT_MUX_HOME
+├── config.json                         # Persistent settings (surface_account, etc.)
+├── state/
+│   └── cooldowns.json                  # Active quota cooldowns with expiry timestamps
 ├── profiles/
 │   ├── antigravity/
 │   │   ├── primary/                    # Isolated $HOME for Account 1
 │   │   ├── secondary/                  # Isolated $HOME for Account 2
-│   │   └── account3/                   # Isolated $HOME for Account 3
+│   │   └── tertiary/                   # Isolated $HOME for Account 3
 │   └── opencode/
 │       ├── primary/
 │       └── secondary/
-└── .rr_<provider>                      # Round-robin state index
+└── .rr_<provider>_<pool>               # Round-robin state tracking
 ```
+
+---
 
 ## Supported Providers
 
-| Provider | ID | Binary | Credential Store | Quota Handling |
+| Provider | ID | Transparent Wrapper | Credential Store | Quota Tracking |
 | :--- | :--- | :--- | :--- | :--- |
-| Google Antigravity | `antigravity`, `agy` | `agy.bin` | `.gemini/antigravity-cli/antigravity-oauth-token` | Dual-pool (Gemini vs Claude) countdown tracking |
-| OpenCode | `opencode` | `opencode` | `.local/share/opencode/auth.json` | Account isolation and rate-limit detection |
+| Google Antigravity | `antigravity`, `agy` | `~/.local/bin/agy` | `.gemini/antigravity-cli/antigravity-oauth-token` | Dual-pool (Gemini vs Claude) via glog UTC timestamps |
+| OpenCode | `opencode` | `~/.local/bin/opencode` | `.local/share/opencode/auth.json` | Account isolation, log rate-limit detection, model probing |
+
+---
 
 ## Quick Start
 
@@ -70,18 +88,18 @@ npm install
 ./install.sh <account1> <account2> [account3...]
 ```
 
-Example with 3 accounts:
+Example with 2 accounts:
 ```bash
-./install.sh primary secondary tertiary
+./install.sh primary secondary
 ```
 
 This will:
-- Build the TypeScript binaries into `dist/` with ESBuild.
+- Build standalone TypeScript binaries into `dist/` with ESBuild.
 - Move the native `agy` binary to `~/.local/bin/agy.bin`.
 - Install `agent-mux` and transparent wrappers (`agy`, `opencode-mux`) into `~/.local/bin/`.
-- Configure isolated profile trees under `~/.agent-mux/profiles/` and symlink shared conversation trajectory storage.
+- Configure isolated profile trees under `~/.agent-mux/profiles/` with symlinked conversation history and shared dotfiles.
 
-### 2. Check Quota & Health Status
+### 2. Inspect Quota & Auth Status
 
 ```bash
 agent-mux status
@@ -96,52 +114,95 @@ Provider: Google Antigravity (antigravity)
       - Pool 'gemini': [READY]
       - Pool 'claude': [READY]
   • secondary [Authenticated]:
-      - Pool 'gemini': [LIMIT (25h 20m remaining)]
-      - Pool 'claude': [READY]
+      - Pool 'gemini': [READY]
+      - Pool 'claude': [LIMIT (155h 15m remaining)]
 ```
 
 ### 3. Active Server Probe
 
-To actively test server ground truth in an isolated `/tmp` workspace without burning unnecessary tokens or indexing directories:
+Verify connectivity and model access live in seconds:
 
 ```bash
+# Probe Antigravity Claude pool on primary account
 agent-mux probe antigravity primary claude
+
+# Probe OpenCode models across all profiles
+agent-mux probe opencode
 ```
+
+---
 
 ## CLI Usage
 
-Run any provider with auto-routing:
+### Direct Routing Commands
+
+Run any provider with automatic quota routing:
 
 ```bash
 agent-mux run antigravity -p "echo hello"
 agent-mux run opencode -p "echo hello"
 ```
 
-Or using the installed transparent wrappers directly:
+Or using the installed transparent wrappers:
 
 ```bash
 agy -p "echo hello"
+opencode
 ```
 
-Options:
-- `--profile <name>`: Explicitly bind the command to a specific profile.
-- `--round-robin`, `--rr`: Alternate sequentially across configured accounts.
+### Routing Options
+
+- `--profile <name>`: Explicitly route to a specific profile.
+- `--round-robin`, `--rr`: Alternate sequentially across healthy accounts.
+
+---
 
 ## Configuration
 
-To customize the base storage location, export `AGENT_MUX_HOME`:
+Settings are saved in `~/.agent-mux/config.json` and can be inspected or modified via the CLI:
+
+### CLI Configuration Commands
 
 ```bash
-export AGENT_MUX_HOME="/custom/storage/agent-mux"
+# View active configuration and resolved settings
+agent-mux config list
+
+# Get a specific setting
+agent-mux config get surface_account
+
+# Set a setting
+agent-mux config set surface_account none
 ```
+
+### Account Surfacing (`surface_account`)
+
+Controls whether and how `agent-mux` injects notifications into the stream output during turn execution:
+
+- **`none`** (default): Stream frames are 100% transparent pass-through. Recommended for production agents to keep LLM context windows completely free of synthetic text.
+- **`tool`**: Injects a synthetic `tool` step card (`agent-mux`) at the beginning of each turn and on failover.
+- **`message`**: Prepends a markdown blockquote (`> 🔄 **[agent-mux]** Active account: <profile>`) to the assistant's first text chunk.
+- **`both`**: Injects both the tool card and the assistant text prefix.
+
+### Environment Variables
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `AGENT_MUX_HOME` | Custom base directory for profiles and state | `~/.agent-mux` |
+| `AGENT_MUX_SURFACE_ACCOUNT` | Overrides `surface_account` mode (`none`, `tool`, `message`, `both`) | Config file / `none` |
+| `AGENT_MUX_PROFILE` | Forces execution to a specific account profile | Auto-routed |
+| `AGY_TARGET_POOL` | Overrides target pool selection (`gemini` or `claude`) | Derived from `--model` |
+
+---
 
 ## Uninstallation
 
-To restore original binaries:
+To remove wrappers and restore the original binaries:
 
 ```bash
 ./uninstall.sh
 ```
+
+---
 
 ## License
 
