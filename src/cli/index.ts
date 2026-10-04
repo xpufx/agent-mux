@@ -154,6 +154,14 @@ Options:
   --round-robin, --rr                         Alternate healthy accounts sequentially
   --help, -h                                  Show this help message
 
+Examples:
+  agent-mux status                            View all accounts and live quota limits
+  agent-mux agy -p "echo hi"                  Auto-route to healthy account and run
+  agent-mux agy --profile secondary           Run using a specific account profile
+  agy --profile primary -p "inspect git"      Direct transparent wrapper invocation
+  agent-mux profile list                      List all accounts and authenticating emails
+  agent-mux cooldowns                         View active rate-limit locks and countdowns
+
 Isolation Modes (agent-mux config set isolation_mode <home|scoped>):
   home                                        (Default) Each profile acts as an independent $HOME.
   scoped                                      $HOME and cwd remain user's real home; configs/tokens

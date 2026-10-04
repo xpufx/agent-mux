@@ -150,10 +150,26 @@ agy -p "echo hello"
 opencode
 ```
 
-### Routing Options
+### Routing Options & Examples
 
-- `--profile <name>`: Explicitly route to a specific profile.
+- `--profile <name>`: Explicitly route to a specific account profile (bypasses auto-routing).
 - `--round-robin`, `--rr`: Alternate sequentially across healthy accounts.
+
+```bash
+# Auto-route to the first ready account with quota:
+agent-mux run antigravity -p "echo hello"
+
+# Explicitly bind to a specific account profile:
+agent-mux run antigravity --profile secondary -p "echo hello"
+agent-mux agy --profile primary --model claude-3-5-sonnet
+
+# Using the installed wrapper directly:
+agy --profile secondary -p "echo hello"
+opencode --profile primary
+
+# Alternate sequentially across healthy accounts:
+agy --round-robin -p "run batch test"
+```
 
 ---
 
