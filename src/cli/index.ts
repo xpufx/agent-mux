@@ -1,7 +1,8 @@
 import { getProviderAdapter, listSupportedProviders } from "../providers/index.js";
 import { getProviderStatus, listProfiles } from "../core/profiles.js";
 import { selectProfile } from "../core/router.js";
-import { runSupervisor } from "../core/supervisor.js";
+import { runSupervisor, parseResetDurationSeconds } from "../core/supervisor.js";
+import { recordCooldown, clearCooldown } from "../core/state.js";
 import { spawn } from "node:child_process";
 
 import {
@@ -56,6 +57,12 @@ async function runProbe(providerId: string, profile?: string, pool?: string) {
         process.stdout.write(`  [Probing ${prof} (${pl})]... `);
         const res = await prov.probe(prof, pl);
         console.log(`[${res.state}: ${res.details}]`);
+        if (res.state === "READY") {
+          clearCooldown(prov.id, prof, pl);
+        } else if (res.state === "LIMIT") {
+          const durSec = parseResetDurationSeconds(res.details);
+          recordCooldown(prov.id, prof, pl, durSec, res.details);
+        }
       }
     } else {
       console.log("  (Provider does not require server-side probing)");
