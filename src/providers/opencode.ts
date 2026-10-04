@@ -10,15 +10,16 @@ export class OpenCodeAdapter implements ProviderAdapter {
   binaryName = "opencode";
 
   get defaultBinaryPath(): string {
+    const realHome = getRealHome();
     const candidates = [
       "/usr/bin/opencode",
       "/usr/local/bin/opencode",
-      path.join(process.env.HOME || "", ".local/bin/opencode")
+      path.join(realHome, ".local/bin/opencode.bin")
     ];
     for (const c of candidates) {
       if (fs.existsSync(c)) return c;
     }
-    return "opencode";
+    return "/usr/bin/opencode";
   }
 
   get profilesBaseDir(): string {
