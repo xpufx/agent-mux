@@ -24,7 +24,7 @@ async function main() {
 
   // Bypass router if already in an isolated profile
   const home = process.env.HOME || "";
-  if (home.includes("/.agy-profiles/") || home.includes("/.agent-profiles/")) {
+  if (home.includes("/.agent-mux/")) {
     const child = spawn(adapter.defaultBinaryPath, args, { stdio: "inherit" });
     child.on("close", (code) => process.exit(code ?? 0));
     return;

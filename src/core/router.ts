@@ -1,8 +1,7 @@
-import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
 import type { ProviderAdapter, RoutingDecision } from "../types.js";
 import { listProfiles } from "./profiles.js";
+import { getAgentMuxHome } from "./paths.js";
 
 export async function selectProfile(
   adapter: ProviderAdapter,
@@ -24,14 +23,16 @@ export async function selectProfile(
     }
   }
 
-  const envProfile = env.AGENT_MUX_PROFILE || (adapter.id === "antigravity" ? env.AGY_PROFILE : undefined);
+  const envProfile = env.AGENT_MUX_PROFILE;
   if (envProfile && profiles.includes(envProfile)) {
     return { profile: envProfile, targetPool, reason: "Environment override" };
   }
 
   // 2. Round-Robin mode
   if (mode === "round-robin" || mode === "rr") {
-    const rrFile = path.join(os.tmpdir(), `agent_mux_rr_${adapter.id}`);
+    const muxHome = getAgentMuxHome();
+    fs.mkdirSync(muxHome, { recursive: true });
+    const rrFile = path.join(muxHome, `.rr_${adapter.id}`);
     let idx = 0;
     try {
       if (fs.existsSync(rrFile)) {
