@@ -47,7 +47,7 @@ async function runProbe(providerId: string, profile?: string, pool?: string) {
   for (const prof of profiles) {
     console.log(`• Profile: ${prof}`);
     if (prov.probe) {
-      const poolsToProbe = pool ? [pool] : ["gemini", "claude"];
+      const poolsToProbe = pool ? [pool] : prov.getSupportedPools();
       for (const pl of poolsToProbe) {
         process.stdout.write(`  [Probing ${prof} (${pl})]... `);
         const res = await prov.probe(prof, pl);
@@ -105,26 +105,189 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
   }
 }
 
+import {
+  loadCooldowns,
+  clearAllCooldowns,
+  clearCooldown
+} from "../core/state.js";
+import { ensureProfile } from "../core/profiles.js";
+
+function printHelp() {
+  console.log(`agent-mux - Multi-Account Multiplexer and Stream Supervisor
+
+Usage:
+  agent-mux status [provider]                 View live quota and auth status
+  agent-mux probe <provider> [profile] [pool] Actively test live model/server access
+  agent-mux profile list [provider]           List all configured account profiles
+  agent-mux profile add <provider> <name>     Scaffold a new account profile
+  agent-mux profile auth <provider> <name>    Launch interactive login for a profile
+  agent-mux cooldowns [list]                  View active cooldown locks and reset times
+  agent-mux cooldowns clear [provider]        Clear persistent cooldown locks
+  agent-mux config [list|get|set]             Manage global configuration
+  agent-mux run <provider> [options] [args]   Run provider binary with auto-routing
+  agent-mux <provider> [args]                 Shorthand for run (e.g. agent-mux agy ...)
+
+Providers:
+  antigravity, agy                            Google Antigravity CLI
+  opencode                                    OpenCode CLI
+
+Options:
+  --profile <name>                            Explicitly select profile (overrides auto-routing)
+  --round-robin, --rr                         Alternate healthy accounts sequentially
+  --help, -h                                  Show this help message
+
+Environment Variables:
+  AGENT_MUX_HOME                              Custom base dir (default: ~/.agent-mux)
+  AGENT_MUX_SURFACE_ACCOUNT                   Stream notification mode (none, tool, message, both)
+  AGENT_MUX_PROFILE                           Force profile for execution
+  AGY_TARGET_POOL                             Override pool (gemini or claude)
+`);
+}
+
+async function handleProfileCommand(args: string[]) {
+  const sub = args[0] || "list";
+
+  if (sub === "list") {
+    const providerId = args[1];
+    const providers = providerId
+      ? [getProviderAdapter(providerId)]
+      : listSupportedProviders();
+
+    console.log("=== Configured Account Profiles ===");
+    for (const prov of providers) {
+      console.log(`\nProvider: ${prov.displayName} (${prov.id})`);
+      console.log(`Base directory: ${prov.profilesBaseDir}`);
+      const profiles = listProfiles(prov);
+      if (profiles.length === 0) {
+        console.log("  (No profiles configured)");
+        continue;
+      }
+      for (const prof of profiles) {
+        const auth = await prov.getAuthStatus(prof);
+        const statusStr = auth ? "\x1b[32mAuthenticated\x1b[0m" : "\x1b[33mPending login\x1b[0m";
+        console.log(`  • ${prof.padEnd(16)} [${statusStr}] -> ${prov.profilesBaseDir}/${prof}`);
+      }
+    }
+    return;
+  }
+
+  if (sub === "add") {
+    const provId = args[1];
+    const profName = args[2];
+    if (!provId || !profName) {
+      console.error("Usage: agent-mux profile add <provider> <profile-name>");
+      process.exit(1);
+    }
+    const adapter = getProviderAdapter(provId);
+    const createdPath = ensureProfile(adapter, profName);
+    console.log(`\x1b[32m[+] Profile '${profName}' scaffolded successfully for ${adapter.displayName}.\x1b[0m`);
+    console.log(`    Location: ${createdPath}`);
+    console.log(`\nTo authenticate this profile, run:`);
+    console.log(`    agent-mux profile auth ${adapter.id} ${profName}`);
+    return;
+  }
+
+  if (sub === "auth") {
+    const provId = args[1];
+    const profName = args[2];
+    if (!provId || !profName) {
+      console.error("Usage: agent-mux profile auth <provider> <profile-name>");
+      process.exit(1);
+    }
+    const adapter = getProviderAdapter(provId);
+    const profDir = ensureProfile(adapter, profName);
+
+    console.log(`\x1b[36m[*] Launching interactive authentication for ${adapter.displayName} (profile: ${profName})...\x1b[0m`);
+    console.log(`    HOME=${profDir}`);
+
+    const child = spawn(adapter.defaultBinaryPath, ["auth"], {
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        HOME: profDir
+      }
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        console.log(`\x1b[32m[✓] Authentication process completed for ${profName}.\x1b[0m`);
+      } else {
+        console.log(`\x1b[33m[!] Authentication process exited with code ${code}.\x1b[0m`);
+      }
+      process.exit(code ?? 0);
+    });
+    return;
+  }
+
+  console.error(`Unknown profile action: ${sub}. Available actions: list, add, auth`);
+  process.exit(1);
+}
+
+function handleCooldownsCommand(args: string[]) {
+  const sub = args[0] || "list";
+
+  if (sub === "list") {
+    const cooldowns = loadCooldowns();
+    const entries = Object.values(cooldowns);
+    console.log("=== Active Quota Cooldown Locks ===");
+    if (entries.length === 0) {
+      console.log("  (No active cooldown locks. All accounts are ready for routing.)");
+      return;
+    }
+
+    const now = Date.now();
+    for (const c of entries) {
+      const remSec = Math.max(0, Math.floor((c.resetAt - now) / 1000));
+      const hours = Math.floor(remSec / 3600);
+      const mins = Math.floor((remSec % 3600) / 60);
+      const secs = remSec % 60;
+      const timeStr = `${hours}h ${mins}m ${secs}s`;
+      console.log(
+        `  • ${c.provider}:${c.profile} (pool: ${c.pool})\n` +
+        `      Remaining: \x1b[33m${timeStr}\x1b[0m\n` +
+        `      Reason:    ${c.reason || "429 / Quota exhausted"}\n` +
+        `      Reset At:  ${new Date(c.resetAt).toISOString()}`
+      );
+    }
+    return;
+  }
+
+  if (sub === "clear") {
+    const prov = args[1];
+    const prof = args[2];
+    const pool = args[3];
+
+    if (prov && prof && pool) {
+      clearCooldown(prov, prof, pool);
+      console.log(`\x1b[32m[✓] Cleared cooldown for ${prov}:${prof}:${pool}\x1b[0m`);
+    } else {
+      const cleared = clearAllCooldowns();
+      console.log(`\x1b[32m[✓] Cleared all active cooldown locks (${cleared} cleared).\x1b[0m`);
+    }
+    return;
+  }
+
+  console.error(`Unknown cooldowns action: ${sub}. Available actions: list, clear`);
+  process.exit(1);
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const cmd = args[0];
 
-  if (!cmd || cmd === "--help" || cmd === "-h") {
-    console.log(`agent-mux - Multi-Account Multiplexer and Stream Supervisor
-
-Usage:
-  agent-mux status [provider]               View live quota and auth status
-  agent-mux probe [provider] [profile]      Actively test server status
-  agent-mux config [get|set|list]           Manage agent-mux configuration
-  agent-mux run <provider> [options] [args] Run provider binary with auto-routing
-  agent-mux <provider> [args]               Shorthand for run
-
-Options:
-  --profile <name>                          Explicitly select profile
-  --round-robin, --rr                       Alternate accounts sequentially
-  --help, -h                                Show this help message
-`);
+  if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") {
+    printHelp();
     process.exit(0);
+  }
+
+  if (cmd === "profile" || cmd === "profiles") {
+    await handleProfileCommand(args.slice(1));
+    return;
+  }
+
+  if (cmd === "cooldown" || cmd === "cooldowns") {
+    handleCooldownsCommand(args.slice(1));
+    return;
   }
 
   if (cmd === "config") {

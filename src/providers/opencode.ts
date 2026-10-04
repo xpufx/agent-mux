@@ -51,6 +51,10 @@ export class OpenCodeAdapter implements ProviderAdapter {
     ];
   }
 
+  getSupportedPools(): string[] {
+    return ["default"];
+  }
+
   async getAuthStatus(profile: string): Promise<boolean> {
     const authPath = path.join(
       this.profilesBaseDir,

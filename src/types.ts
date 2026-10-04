@@ -24,6 +24,7 @@ export interface ProviderAdapter {
   getQuotaStatus(profile: string): Promise<PoolQuota[]>;
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string;
   getSharedPaths(): string[];
+  getSupportedPools(): string[];
   probe?(profile: string, pool: string): Promise<{ state: QuotaState; details: string }>;
 }
 

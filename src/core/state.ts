@@ -95,6 +95,13 @@ export function clearCooldown(provider: string, profile: string, pool: string): 
   }
 }
 
+export function clearAllCooldowns(): number {
+  const cooldowns = loadCooldowns();
+  const count = Object.keys(cooldowns).length;
+  saveCooldowns({});
+  return count;
+}
+
 export function checkCooldown(
   provider: string,
   profile: string,

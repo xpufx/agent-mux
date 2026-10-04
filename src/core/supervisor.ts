@@ -321,7 +321,16 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       // If all candidates are in cooldown or already tried, STOP. Do not flap!
       if (decision.allCooldown || triedProfiles.has(decision.profile)) {
         process.stderr.write(
-          `\n[agent-mux] ${reason} on ${currentProfile} (pool: ${targetPool}). All candidate profiles are exhausted. Halting failover.\n`
+          `\n\x1b[31;1m[agent-mux] QUOTA EXHAUSTED: ${reason} on ${currentProfile} (pool: ${targetPool}).\x1b[0m\n` +
+          `\x1b[33mAll configured profiles for '${targetPool}' are currently in cooldown or rate-limited.\x1b[0m\n` +
+          `\x1b[90mSuggested actions:\x1b[0m\n` +
+          `  1. Check quota recovery:   \x1b[36magent-mux status ${adapter.id}\x1b[0m\n` +
+          `  2. View active cooldowns:  \x1b[36magent-mux cooldowns\x1b[0m\n` +
+          (targetPool === "claude"
+            ? `  3. Switch model pool:      \x1b[36m--model gemini-2.5-pro\x1b[0m (Gemini pool often has quota)\n`
+            : "") +
+          `  4. Clear cooldown locks:   \x1b[36magent-mux cooldowns clear\x1b[0m (if provider quota reset)\n` +
+          `  5. Add another account:    \x1b[36magent-mux profile add ${adapter.id} <account>\x1b[0m\n\n`
         );
         if (rawErrorLine) {
           process.stdout.write(rawErrorLine + "\n");

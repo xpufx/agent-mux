@@ -157,6 +157,38 @@ opencode
 
 ---
 
+## Profile Management
+
+Manage and authenticate isolated provider accounts:
+
+```bash
+# List all configured accounts and authentication state
+agent-mux profile list
+
+# Scaffold a new account profile (symlinks dotfiles and trajectories)
+agent-mux profile add antigravity tertiary
+
+# Interactively log in to an account profile
+agent-mux profile auth antigravity tertiary
+```
+
+---
+
+## Quota Cooldown Management
+
+When a profile encounters a 429 / Quota Exhaustion, `agent-mux` records a persistent cooldown:
+
+```bash
+# View active quota locks and remaining cooldown time
+agent-mux cooldowns
+
+# Manually clear all cooldown locks (e.g. after quota resets early)
+agent-mux cooldowns clear
+
+# Clear cooldown for a specific provider, profile, and pool
+agent-mux cooldowns clear antigravity primary claude
+```
+
 ## Configuration
 
 Settings are saved in `~/.agent-mux/config.json` and can be inspected or modified via the CLI:

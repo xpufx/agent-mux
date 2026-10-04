@@ -55,6 +55,10 @@ export class AntigravityAdapter implements ProviderAdapter {
     ];
   }
 
+  getSupportedPools(): string[] {
+    return ["gemini", "claude"];
+  }
+
   async getAuthStatus(profile: string): Promise<boolean> {
     const tokenPath = path.join(
       this.profilesBaseDir,
