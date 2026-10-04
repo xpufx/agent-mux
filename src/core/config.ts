@@ -64,6 +64,6 @@ export function getSurfaceAccountMode(): SurfaceAccountMode {
     if (parsed) return parsed;
   }
 
-  // 3. Default to "tool" (stream frame injection)
-  return "tool";
+  // 3. Default to "none" (preserves clean agent conversation history without context pollution)
+  return "none";
 }

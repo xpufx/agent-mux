@@ -316,6 +316,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               initConsumed = true;
               isRelaunching = false;
               turnSurfaced = false;
+              rl.close();
 
               // Re-send last user message
               if (lastUserMessage && newChild.stdin && !newChild.stdin.destroyed) {
