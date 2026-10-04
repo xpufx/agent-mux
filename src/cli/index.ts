@@ -4,6 +4,14 @@ import { selectProfile } from "../core/router.js";
 import { runSupervisor } from "../core/supervisor.js";
 import { spawn } from "node:child_process";
 
+import {
+  loadConfig,
+  saveConfig,
+  getSurfaceAccountMode,
+  parseSurfaceAccountMode,
+  getConfigFilePath
+} from "../core/config.js";
+
 async function printStatus(providerId?: string) {
   const providers = providerId
     ? [getProviderAdapter(providerId)]
@@ -107,6 +115,7 @@ async function main() {
 Usage:
   agent-mux status [provider]               View live quota and auth status
   agent-mux probe [provider] [profile]      Actively test server status
+  agent-mux config [get|set|list]           Manage agent-mux configuration
   agent-mux run <provider> [options] [args] Run provider binary with auto-routing
   agent-mux <provider> [args]               Shorthand for run
 
@@ -116,6 +125,69 @@ Options:
   --help, -h                                Show this help message
 `);
     process.exit(0);
+  }
+
+  if (cmd === "config") {
+    const sub = args[1] || "list";
+    if (sub === "list") {
+      const cfg = loadConfig();
+      const activeMode = getSurfaceAccountMode();
+      console.log("=== agent-mux Configuration ===");
+      console.log(`Config file: ${getConfigFilePath()}`);
+      console.log(
+        `Active surface_account: ${activeMode}${
+          process.env.AGENT_MUX_SURFACE_ACCOUNT
+            ? " (overridden by AGENT_MUX_SURFACE_ACCOUNT env)"
+            : ""
+        }`
+      );
+      console.log("\nSettings in config file:");
+      console.log(JSON.stringify(cfg, null, 2));
+      return;
+    }
+
+    if (sub === "get") {
+      const key = args[2];
+      if (!key) {
+        console.error("Usage: agent-mux config get <key>");
+        process.exit(1);
+      }
+      if (key === "surface_account") {
+        console.log(getSurfaceAccountMode());
+      } else {
+        const cfg = loadConfig();
+        console.log(cfg[key] ?? "");
+      }
+      return;
+    }
+
+    if (sub === "set") {
+      const key = args[2];
+      const val = args[3];
+      if (!key || val === undefined) {
+        console.error("Usage: agent-mux config set <key> <value>");
+        process.exit(1);
+      }
+      const cfg = loadConfig();
+      if (key === "surface_account") {
+        const parsed = parseSurfaceAccountMode(val);
+        if (!parsed) {
+          console.error(
+            `Invalid surface_account mode: '${val}'. Valid options: tool, message, both, none`
+          );
+          process.exit(1);
+        }
+        cfg.surface_account = parsed;
+      } else {
+        cfg[key] = val;
+      }
+      saveConfig(cfg);
+      console.log(`Config saved: ${key} = ${val}`);
+      return;
+    }
+
+    console.error(`Unknown config action: ${sub}. Use: list, get, set`);
+    process.exit(1);
   }
 
   if (cmd === "status") {
