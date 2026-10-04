@@ -10,6 +10,7 @@ export interface PoolQuota {
 export interface ProfileStatus {
   profile: string;
   authenticated: boolean;
+  accountIdentity?: string;
   pools: PoolQuota[];
 }
 
@@ -21,6 +22,7 @@ export interface ProviderAdapter {
   profilesBaseDir: string;
   
   getAuthStatus(profile: string): Promise<boolean>;
+  getAccountIdentity?(profile: string): Promise<string | undefined>;
   getQuotaStatus(profile: string): Promise<PoolQuota[]>;
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string;
   getSharedPaths(): string[];

@@ -70,6 +70,41 @@ export class OpenCodeAdapter implements ProviderAdapter {
     }
   }
 
+  async getAccountIdentity(profile: string): Promise<string | undefined> {
+    const authPath = path.join(
+      this.profilesBaseDir,
+      profile,
+      ".local/share/opencode/auth.json"
+    );
+    if (!fs.existsSync(authPath)) return undefined;
+
+    try {
+      const data = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+      const items: string[] = [];
+
+      for (const [providerName, cred] of Object.entries(data)) {
+        if (!cred || typeof cred !== "object") continue;
+        const c = cred as { key?: string; email?: string; user?: string; type?: string };
+        if (c.email) {
+          items.push(`${providerName}: ${c.email}`);
+        } else if (c.key && typeof c.key === "string") {
+          // Show key prefix/suffix fingerprint for distinguishing accounts
+          const key = c.key;
+          const masked = key.length > 14
+            ? `${key.slice(0, 8)}...${key.slice(-4)}`
+            : `${key.slice(0, 4)}...`;
+          items.push(`${providerName} (${masked})`);
+        } else {
+          items.push(`${providerName}`);
+        }
+      }
+
+      return items.length > 0 ? items.join(", ") : undefined;
+    } catch {}
+
+    return undefined;
+  }
+
   async getQuotaStatus(profile: string): Promise<PoolQuota[]> {
     const logDir = path.join(
       this.profilesBaseDir,

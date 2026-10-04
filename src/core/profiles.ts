@@ -56,10 +56,14 @@ export async function getProviderStatus(adapter: ProviderAdapter): Promise<Profi
 
   for (const prof of profiles) {
     const authenticated = await adapter.getAuthStatus(prof);
+    const accountIdentity = adapter.getAccountIdentity
+      ? await adapter.getAccountIdentity(prof)
+      : undefined;
     const pools = await adapter.getQuotaStatus(prof);
     results.push({
       profile: prof,
       authenticated,
+      accountIdentity,
       pools
     });
   }

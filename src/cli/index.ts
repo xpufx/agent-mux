@@ -30,7 +30,8 @@ async function printStatus(providerId?: string) {
 
     for (const p of profiles) {
       const authStr = p.authenticated ? "Authenticated" : "Pending login";
-      console.log(`  • ${p.profile} [${authStr}]:`);
+      const idStr = p.accountIdentity ? ` (${p.accountIdentity})` : "";
+      console.log(`  • ${p.profile} [${authStr}]${idStr}:`);
       for (const pool of p.pools) {
         const detailStr = pool.details ? ` (${pool.details})` : "";
         console.log(`      - Pool '${pool.pool}': [${pool.state}${detailStr}]`);
@@ -165,7 +166,9 @@ async function handleProfileCommand(args: string[]) {
       for (const prof of profiles) {
         const auth = await prov.getAuthStatus(prof);
         const statusStr = auth ? "\x1b[32mAuthenticated\x1b[0m" : "\x1b[33mPending login\x1b[0m";
-        console.log(`  • ${prof.padEnd(16)} [${statusStr}] -> ${prov.profilesBaseDir}/${prof}`);
+        const identity = prov.getAccountIdentity ? await prov.getAccountIdentity(prof) : undefined;
+        const idStr = identity ? ` \x1b[90m(${identity})\x1b[0m` : "";
+        console.log(`  • ${prof.padEnd(16)} [${statusStr}]${idStr} -> ${prov.profilesBaseDir}/${prof}`);
       }
     }
     return;

@@ -68,6 +68,32 @@ export class AntigravityAdapter implements ProviderAdapter {
     return fs.existsSync(tokenPath);
   }
 
+  async getAccountIdentity(profile: string): Promise<string | undefined> {
+    const tokenPath = path.join(
+      this.profilesBaseDir,
+      profile,
+      ".gemini/antigravity-cli/antigravity-oauth-token"
+    );
+    if (!fs.existsSync(tokenPath)) return undefined;
+
+    try {
+      const data = JSON.parse(fs.readFileSync(tokenPath, "utf-8"));
+      const idToken = data.id_token;
+      if (!idToken || typeof idToken !== "string") return undefined;
+
+      const parts = idToken.split(".");
+      if (parts.length >= 2) {
+        const payloadJson = Buffer.from(parts[1], "base64url").toString("utf-8");
+        const payload = JSON.parse(payloadJson);
+        if (payload.email) {
+          return payload.email;
+        }
+      }
+    } catch {}
+
+    return undefined;
+  }
+
   async getQuotaStatus(profile: string): Promise<PoolQuota[]> {
     const logDir = path.join(
       this.profilesBaseDir,
