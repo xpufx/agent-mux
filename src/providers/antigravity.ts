@@ -198,9 +198,11 @@ export class AntigravityAdapter implements ProviderAdapter {
             }
           }
 
-          if (isQuotaError(line)) {
+          // Only inspect genuine glog ERROR lines (starts with 'E<MM><DD>').
+          // Never inspect user input loops or informational logs to prevent prompt contamination!
+          if (line.startsWith("E") && isQuotaError(line) && !line.includes("HandleUserInput")) {
             // Parse exact timestamp from glog line header (e.g. E1004 11:55:39.446807)
-            const tsMatch = line.match(/^[IWEF](\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+            const tsMatch = line.match(/^E(\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
             let lineTimestamp = stats.mtimeMs;
             if (tsMatch) {
               const [, mo, da, hr, mi, se] = tsMatch;
