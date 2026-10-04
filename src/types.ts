@@ -1,3 +1,5 @@
+import type { IsolationMode } from "./core/config.js";
+
 export type QuotaState = "READY" | "LIMIT" | "UNKNOWN" | "CAPACITY_SPIKE";
 
 export interface PoolQuota {
@@ -27,6 +29,12 @@ export interface ProviderAdapter {
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string;
   getSharedPaths(): string[];
   getSupportedPools(): string[];
+  prepareExecution?(
+    profile: string,
+    args: string[],
+    baseEnv: NodeJS.ProcessEnv,
+    isolationMode: IsolationMode
+  ): { binary: string; args: string[]; env: NodeJS.ProcessEnv };
   probe?(profile: string, pool: string): Promise<{ state: QuotaState; details: string }>;
 }
 

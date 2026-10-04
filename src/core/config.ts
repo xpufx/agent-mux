@@ -3,9 +3,11 @@ import path from "node:path";
 import { getAgentMuxHome } from "./paths.js";
 
 export type SurfaceAccountMode = "tool" | "message" | "both" | "none";
+export type IsolationMode = "scoped" | "home";
 
 export interface AgentMuxConfig {
   surface_account?: SurfaceAccountMode;
+  isolation_mode?: IsolationMode;
   [key: string]: unknown;
 }
 
@@ -66,4 +68,34 @@ export function getSurfaceAccountMode(): SurfaceAccountMode {
 
   // 3. Default to "none" (preserves clean agent conversation history without context pollution)
   return "none";
+}
+
+export function parseIsolationMode(val: unknown): IsolationMode | undefined {
+  if (typeof val !== "string") return undefined;
+  const s = val.toLowerCase().trim();
+  if (s === "scoped" || s === "shared" || s === "bwrap" || s === "mount") {
+    return "scoped";
+  }
+  if (s === "home" || s === "profile-home" || s === "isolated-home" || s === "isolated") {
+    return "home";
+  }
+  return undefined;
+}
+
+export function getIsolationMode(): IsolationMode {
+  // 1. Environment variable override
+  if (process.env.AGENT_MUX_ISOLATION_MODE !== undefined) {
+    const parsed = parseIsolationMode(process.env.AGENT_MUX_ISOLATION_MODE);
+    if (parsed) return parsed;
+  }
+
+  // 2. Persistent config file
+  const config = loadConfig();
+  if (config.isolation_mode) {
+    const parsed = parseIsolationMode(config.isolation_mode);
+    if (parsed) return parsed;
+  }
+
+  // 3. Default to "home" (profile directory acts as independent HOME, complete isolation)
+  return "home";
 }

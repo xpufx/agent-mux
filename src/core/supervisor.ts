@@ -3,7 +3,11 @@ import readline from "node:readline";
 import path from "node:path";
 import type { ProviderAdapter } from "../types.js";
 import { listProfiles, ensureProfile } from "./profiles.js";
-import { getSurfaceAccountMode, type SurfaceAccountMode } from "./config.js";
+import {
+  getSurfaceAccountMode,
+  getIsolationMode,
+  type SurfaceAccountMode
+} from "./config.js";
 import { recordCooldown } from "./state.js";
 import { selectProfile } from "./router.js";
 
@@ -131,19 +135,34 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
   function spawnChild(prof: string): ChildProcess {
     const profDir = ensureProfile(adapter, prof);
-    const childEnv = {
-      ...process.env,
-      ...options.env,
-      HOME: profDir
-    };
+    const isolationMode = getIsolationMode();
 
     const finalArgs = [...args];
     if (conversationId && !finalArgs.includes("--conversation")) {
       finalArgs.push("--conversation", conversationId);
     }
 
-    const proc = spawn(binaryPath, finalArgs, {
-      env: childEnv,
+    const baseEnv = {
+      ...process.env,
+      ...options.env
+    };
+
+    let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
+    if (adapter.prepareExecution) {
+      execTarget = adapter.prepareExecution(prof, finalArgs, baseEnv, isolationMode);
+    } else {
+      execTarget = {
+        binary: binaryPath,
+        args: finalArgs,
+        env: {
+          ...baseEnv,
+          HOME: profDir
+        }
+      };
+    }
+
+    const proc = spawn(execTarget.binary, execTarget.args, {
+      env: execTarget.env,
       stdio: ["pipe", "pipe", "pipe"]
     });
 

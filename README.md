@@ -206,20 +206,30 @@ agent-mux config get surface_account
 agent-mux config set surface_account none
 ```
 
-### Account Surfacing (`surface_account`)
+### Isolation Modes (`isolation_mode`)
 
-Controls whether and how `agent-mux` injects notifications into the stream output during turn execution:
+Controls how account isolation and the agent process environment are handled:
 
-- **`none`** (default): Stream frames are 100% transparent pass-through. Recommended for production agents to keep LLM context windows completely free of synthetic text.
-- **`tool`**: Injects a synthetic `tool` step card (`agent-mux`) at the beginning of each turn and on failover.
-- **`message`**: Prepends a markdown blockquote (`> 🔄 **[agent-mux]** Active account: <profile>`) to the assistant's first text chunk.
-- **`both`**: Injects both the tool card and the assistant text prefix.
+- **`home`** (default): Each profile acts as an independent `$HOME` (`~/.agent-mux/profiles/<provider>/<profile>`). Fully isolated dotfiles, caches, and history per profile.
+- **`scoped`**: The agent process keeps the real user `$HOME` and `cwd` (`/home/<user>`). Only provider-specific configs and credentials are scoped per profile:
+  - Antigravity uses a private Linux mount overlay via `bwrap` mapping `~/.gemini` to the profile.
+  - OpenCode uses `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
+  - Both instances can run concurrently with real `$HOME` and real working directory.
+
+```bash
+# Switch to scoped mode (real HOME with scoped configs)
+agent-mux config set isolation_mode scoped
+
+# Switch back to isolated home mode (independent HOME per profile)
+agent-mux config set isolation_mode home
+```
 
 ### Environment Variables
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `AGENT_MUX_HOME` | Custom base directory for profiles and state | `~/.agent-mux` |
+| `AGENT_MUX_ISOLATION_MODE` | Overrides `isolation_mode` (`home` or `scoped`) | Config file / `home` |
 | `AGENT_MUX_SURFACE_ACCOUNT` | Overrides `surface_account` mode (`none`, `tool`, `message`, `both`) | Config file / `none` |
 | `AGENT_MUX_PROFILE` | Forces execution to a specific account profile | Auto-routed |
 | `AGY_TARGET_POOL` | Overrides target pool selection (`gemini` or `claude`) | Derived from `--model` |

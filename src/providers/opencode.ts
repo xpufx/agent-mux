@@ -55,6 +55,48 @@ export class OpenCodeAdapter implements ProviderAdapter {
     return ["default"];
   }
 
+  prepareExecution(
+    profile: string,
+    args: string[],
+    baseEnv: NodeJS.ProcessEnv,
+    isolationMode: string
+  ): { binary: string; args: string[]; env: NodeJS.ProcessEnv } {
+    const profDir = path.join(this.profilesBaseDir, profile);
+    const realHome = getRealHome();
+
+    if (isolationMode === "scoped") {
+      // In scoped mode: HOME and cwd remain the real user home.
+      // Redirect XDG_DATA_HOME and XDG_CONFIG_HOME to profile directories.
+      const dataHome = path.join(profDir, ".local/share");
+      const configHome = path.join(profDir, ".config");
+      fs.mkdirSync(dataHome, { recursive: true });
+      fs.mkdirSync(configHome, { recursive: true });
+
+      return {
+        binary: this.defaultBinaryPath,
+        args,
+        env: {
+          ...baseEnv,
+          HOME: realHome,
+          REAL_HOME: realHome,
+          XDG_DATA_HOME: dataHome,
+          XDG_CONFIG_HOME: configHome
+        }
+      };
+    }
+
+    // Default "home" mode: profile acts as independent HOME directory
+    return {
+      binary: this.defaultBinaryPath,
+      args,
+      env: {
+        ...baseEnv,
+        HOME: profDir,
+        REAL_HOME: realHome
+      }
+    };
+  }
+
   async getAuthStatus(profile: string): Promise<boolean> {
     const authPath = path.join(
       this.profilesBaseDir,

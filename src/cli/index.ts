@@ -9,6 +9,8 @@ import {
   saveConfig,
   getSurfaceAccountMode,
   parseSurfaceAccountMode,
+  getIsolationMode,
+  parseIsolationMode,
   getConfigFilePath
 } from "../core/config.js";
 
@@ -17,7 +19,8 @@ async function printStatus(providerId?: string) {
     ? [getProviderAdapter(providerId)]
     : listSupportedProviders();
 
-  console.log("=== agent-mux Provider & Profile Status ===");
+  const activeIso = getIsolationMode();
+  console.log(`=== agent-mux Provider & Profile Status [Isolation Mode: ${activeIso}] ===`);
 
   for (const prov of providers) {
     console.log(`\nProvider: ${prov.displayName} (${prov.id})`);
@@ -92,12 +95,25 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
     process.exit(code);
   } else {
     const profDir = `${adapter.profilesBaseDir}/${decision.profile}`;
-    const child = spawn(adapter.defaultBinaryPath, cmdArgs, {
+    const isolationMode = getIsolationMode();
+    let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
+
+    if (adapter.prepareExecution) {
+      execTarget = adapter.prepareExecution(decision.profile, cmdArgs, process.env, isolationMode);
+    } else {
+      execTarget = {
+        binary: adapter.defaultBinaryPath,
+        args: cmdArgs,
+        env: {
+          ...process.env,
+          HOME: profDir
+        }
+      };
+    }
+
+    const child = spawn(execTarget.binary, execTarget.args, {
       stdio: "inherit",
-      env: {
-        ...process.env,
-        HOME: profDir
-      }
+      env: execTarget.env
     });
 
     child.on("close", (code) => {
@@ -137,8 +153,14 @@ Options:
   --round-robin, --rr                         Alternate healthy accounts sequentially
   --help, -h                                  Show this help message
 
+Isolation Modes (agent-mux config set isolation_mode <home|scoped>):
+  home                                        (Default) Each profile acts as an independent $HOME.
+  scoped                                      $HOME and cwd remain user's real home; configs/tokens
+                                              are scoped per profile (concurrent-safe via bwrap/XDG).
+
 Environment Variables:
   AGENT_MUX_HOME                              Custom base dir (default: ~/.agent-mux)
+  AGENT_MUX_ISOLATION_MODE                    Override isolation mode (home or scoped)
   AGENT_MUX_SURFACE_ACCOUNT                   Stream notification mode (none, tool, message, both)
   AGENT_MUX_PROFILE                           Force profile for execution
   AGY_TARGET_POOL                             Override pool (gemini or claude)
@@ -154,7 +176,8 @@ async function handleProfileCommand(args: string[]) {
       ? [getProviderAdapter(providerId)]
       : listSupportedProviders();
 
-    console.log("=== Configured Account Profiles ===");
+    const activeIso = getIsolationMode();
+    console.log(`=== Configured Account Profiles [Isolation Mode: ${activeIso}] ===`);
     for (const prov of providers) {
       console.log(`\nProvider: ${prov.displayName} (${prov.id})`);
       console.log(`Base directory: ${prov.profilesBaseDir}`);
@@ -297,13 +320,21 @@ async function main() {
     const sub = args[1] || "list";
     if (sub === "list") {
       const cfg = loadConfig();
-      const activeMode = getSurfaceAccountMode();
+      const activeSurface = getSurfaceAccountMode();
+      const activeIsolation = getIsolationMode();
       console.log("=== agent-mux Configuration ===");
       console.log(`Config file: ${getConfigFilePath()}`);
       console.log(
-        `Active surface_account: ${activeMode}${
+        `Active surface_account: ${activeSurface}${
           process.env.AGENT_MUX_SURFACE_ACCOUNT
             ? " (overridden by AGENT_MUX_SURFACE_ACCOUNT env)"
+            : ""
+        }`
+      );
+      console.log(
+        `Active isolation_mode:  ${activeIsolation}${
+          process.env.AGENT_MUX_ISOLATION_MODE
+            ? " (overridden by AGENT_MUX_ISOLATION_MODE env)"
             : ""
         }`
       );
@@ -320,6 +351,8 @@ async function main() {
       }
       if (key === "surface_account") {
         console.log(getSurfaceAccountMode());
+      } else if (key === "isolation_mode") {
+        console.log(getIsolationMode());
       } else {
         const cfg = loadConfig();
         console.log(cfg[key] ?? "");
@@ -344,6 +377,15 @@ async function main() {
           process.exit(1);
         }
         cfg.surface_account = parsed;
+      } else if (key === "isolation_mode") {
+        const parsed = parseIsolationMode(val);
+        if (!parsed) {
+          console.error(
+            `Invalid isolation_mode: '${val}'. Valid options: scoped (real HOME with scoped configs), home (independent HOME per profile)`
+          );
+          process.exit(1);
+        }
+        cfg.isolation_mode = parsed;
       } else {
         cfg[key] = val;
       }

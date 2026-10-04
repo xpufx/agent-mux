@@ -59,6 +59,53 @@ export class AntigravityAdapter implements ProviderAdapter {
     return ["gemini", "claude"];
   }
 
+  prepareExecution(
+    profile: string,
+    args: string[],
+    baseEnv: NodeJS.ProcessEnv,
+    isolationMode: string
+  ): { binary: string; args: string[]; env: NodeJS.ProcessEnv } {
+    const profDir = path.join(this.profilesBaseDir, profile);
+    const realHome = getRealHome();
+
+    if (isolationMode === "scoped") {
+      // In scoped mode: HOME and cwd remain the real user home.
+      // Use bwrap to overlay the profile's .gemini onto real ~/.gemini privately.
+      const profGeminiDir = path.join(profDir, ".gemini");
+      const realGeminiDir = path.join(realHome, ".gemini");
+      fs.mkdirSync(profGeminiDir, { recursive: true });
+      fs.mkdirSync(realGeminiDir, { recursive: true });
+
+      const bwrapArgs = [
+        "--dev-bind", "/", "/",
+        "--bind", profGeminiDir, realGeminiDir,
+        this.defaultBinaryPath,
+        ...args
+      ];
+
+      return {
+        binary: "bwrap",
+        args: bwrapArgs,
+        env: {
+          ...baseEnv,
+          HOME: realHome,
+          REAL_HOME: realHome
+        }
+      };
+    }
+
+    // Default "home" mode: profile acts as independent HOME directory
+    return {
+      binary: this.defaultBinaryPath,
+      args,
+      env: {
+        ...baseEnv,
+        HOME: profDir,
+        REAL_HOME: realHome
+      }
+    };
+  }
+
   async getAuthStatus(profile: string): Promise<boolean> {
     const tokenPath = path.join(
       this.profilesBaseDir,
