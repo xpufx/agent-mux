@@ -131,8 +131,7 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
 
 import {
   loadCooldowns,
-  clearAllCooldowns,
-  clearCooldown
+  clearAllCooldowns
 } from "../core/state.js";
 import { ensureProfile, removeProfile } from "../core/profiles.js";
 
