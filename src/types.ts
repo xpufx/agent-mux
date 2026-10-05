@@ -29,6 +29,7 @@ export interface ProviderAdapter {
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string;
   getSharedPaths(): string[];
   getSupportedPools(): string[];
+  getPoolModel?(pool: string): string | undefined;
   prepareExecution?(
     profile: string,
     args: string[],
@@ -42,5 +43,6 @@ export interface ProviderAdapter {
 export interface RoutingDecision {
   profile: string;
   targetPool: string;
+  pool: string;
   reason: string;
 }

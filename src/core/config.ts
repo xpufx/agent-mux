@@ -4,10 +4,12 @@ import { getAgentMuxHome } from "./paths.js";
 
 export type SurfaceAccountMode = "tool" | "message" | "both" | "none";
 export type IsolationMode = "scoped" | "home";
+export type RoutingPolicy = "pool-strict" | "pool-spillover" | "account-first";
 
 export interface AgentMuxConfig {
   surface_account?: SurfaceAccountMode;
   isolation_mode?: IsolationMode;
+  routingPolicy?: RoutingPolicy;
   [key: string]: unknown;
 }
 
@@ -68,6 +70,33 @@ export function getSurfaceAccountMode(): SurfaceAccountMode {
 
   // 3. Default to "none" (preserves clean agent conversation history without context pollution)
   return "none";
+}
+
+export function parseRoutingPolicy(val: unknown): RoutingPolicy | undefined {
+  if (typeof val !== "string") return undefined;
+  const s = val.toLowerCase().trim();
+  if (s === "pool-strict") return "pool-strict";
+  if (s === "pool-spillover") return "pool-spillover";
+  if (s === "account-first") return "account-first";
+  return undefined;
+}
+
+export function getRoutingPolicy(): RoutingPolicy {
+  // 1. Environment variable override
+  if (process.env.AGENT_MUX_ROUTING_POLICY !== undefined) {
+    const parsed = parseRoutingPolicy(process.env.AGENT_MUX_ROUTING_POLICY);
+    if (parsed) return parsed;
+  }
+
+  // 2. Persistent config file
+  const config = loadConfig();
+  if (config.routingPolicy) {
+    const parsed = parseRoutingPolicy(config.routingPolicy);
+    if (parsed) return parsed;
+  }
+
+  // 3. Default to "pool-strict" (stay within the requested pool, never drift)
+  return "pool-strict";
 }
 
 export function parseIsolationMode(val: unknown): IsolationMode | undefined {

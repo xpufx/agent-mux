@@ -1,6 +1,6 @@
 import { getProviderAdapter, listSupportedProviders } from "../providers/index.js";
 import { getProviderStatus, listProfiles } from "../core/profiles.js";
-import { selectProfile } from "../core/router.js";
+import { selectProfile, applyPoolModel } from "../core/router.js";
 import { runSupervisor, parseResetDurationSeconds } from "../core/supervisor.js";
 import { recordCooldown, clearCooldown } from "../core/state.js";
 import { spawn } from "node:child_process";
@@ -12,6 +12,8 @@ import {
   parseSurfaceAccountMode,
   getIsolationMode,
   parseIsolationMode,
+  getRoutingPolicy,
+  parseRoutingPolicy,
   getConfigFilePath
 } from "../core/config.js";
 import { getAgentLogFilePath } from "../core/paths.js";
@@ -93,11 +95,13 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
   }
 
   const decision = await selectProfile(adapter, cmdArgs, process.env, mode);
+  const execArgs = applyPoolModel(adapter, cmdArgs, decision.pool);
 
   if (isStreamJson) {
     const code = await runSupervisor({
       adapter,
       initialProfile: decision.profile,
+      initialPool: decision.pool,
       binaryPath: adapter.defaultBinaryPath,
       args: cmdArgs
     });
@@ -108,11 +112,11 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
     let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
 
     if (adapter.prepareExecution) {
-      execTarget = adapter.prepareExecution(decision.profile, cmdArgs, process.env, isolationMode);
+      execTarget = adapter.prepareExecution(decision.profile, execArgs, process.env, isolationMode);
     } else {
       execTarget = {
         binary: adapter.defaultBinaryPath,
-        args: cmdArgs,
+        args: execArgs,
         env: {
           ...process.env,
           HOME: profDir
@@ -184,6 +188,7 @@ Environment Variables:
   AGENT_MUX_HOME                              Custom base dir (default: ~/.agent-mux)
   AGENT_MUX_ISOLATION_MODE                    Override isolation mode (home or scoped)
   AGENT_MUX_SURFACE_ACCOUNT                   Stream notification mode (none, tool, message, both)
+  AGENT_MUX_ROUTING_POLICY                    Failover order (pool-strict, pool-spillover, account-first)
   AGENT_MUX_PROFILE                           Force profile for execution
   AGY_TARGET_POOL                             Override pool (gemini or claude)
 `);
@@ -406,6 +411,7 @@ async function main() {
       const cfg = loadConfig();
       const activeSurface = getSurfaceAccountMode();
       const activeIsolation = getIsolationMode();
+      const activeRoutingPolicy = getRoutingPolicy();
       console.log("=== agent-mux Configuration ===");
       console.log(`Config file: ${getConfigFilePath()}`);
       console.log(
@@ -419,6 +425,13 @@ async function main() {
         `Active isolation_mode:  ${activeIsolation}${
           process.env.AGENT_MUX_ISOLATION_MODE
             ? " (overridden by AGENT_MUX_ISOLATION_MODE env)"
+            : ""
+        }`
+      );
+      console.log(
+        `Active routingPolicy:   ${activeRoutingPolicy}${
+          process.env.AGENT_MUX_ROUTING_POLICY
+            ? " (overridden by AGENT_MUX_ROUTING_POLICY env)"
             : ""
         }`
       );
@@ -437,6 +450,8 @@ async function main() {
         console.log(getSurfaceAccountMode());
       } else if (key === "isolation_mode") {
         console.log(getIsolationMode());
+      } else if (key === "routingPolicy" || key === "routing_policy") {
+        console.log(getRoutingPolicy());
       } else {
         const cfg = loadConfig();
         console.log(cfg[key] ?? "");
@@ -470,6 +485,15 @@ async function main() {
           process.exit(1);
         }
         cfg.isolation_mode = parsed;
+      } else if (key === "routingPolicy" || key === "routing_policy") {
+        const parsed = parseRoutingPolicy(val);
+        if (!parsed) {
+          console.error(
+            `Invalid routingPolicy: '${val}'. Valid options: pool-strict, pool-spillover, account-first`
+          );
+          process.exit(1);
+        }
+        cfg.routingPolicy = parsed;
       } else {
         cfg[key] = val;
       }

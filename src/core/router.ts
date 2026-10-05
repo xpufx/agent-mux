@@ -1,16 +1,79 @@
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
-import type { ProviderAdapter, RoutingDecision } from "../types.js";
+import type { ProviderAdapter, PoolQuota, RoutingDecision } from "../types.js";
 import { listProfiles } from "./profiles.js";
 import { getAgentMuxHome } from "./paths.js";
 import { checkCooldown, logMuxMessage } from "./state.js";
+import { getRoutingPolicy, type RoutingPolicy } from "./config.js";
 
 export interface CandidateStatus {
   profile: string;
+  pool: string;
   isHealthy: boolean;
   remainingSec: number;
   reason: string;
+}
+
+export function candidateKey(profile: string, pool: string): string {
+  return `${profile}:${pool}`;
+}
+
+/**
+ * Build the ordered `(profile, pool)` candidates for a routing policy.
+ * - `pool-strict`:   targetPool across all profiles.
+ * - `pool-spillover`: targetPool across all profiles, then each other pool across all profiles.
+ * - `account-first`:  for each profile, targetPool then each other pool.
+ */
+export function buildCandidateOrder(
+  profiles: string[],
+  targetPool: string,
+  otherPools: string[],
+  policy: RoutingPolicy
+): Array<{ profile: string; pool: string }> {
+  const pools = [targetPool, ...otherPools];
+  const order: Array<{ profile: string; pool: string }> = [];
+
+  if (policy === "pool-spillover") {
+    for (const pool of pools) {
+      for (const profile of profiles) order.push({ profile, pool });
+    }
+  } else if (policy === "account-first") {
+    for (const profile of profiles) {
+      for (const pool of pools) order.push({ profile, pool });
+    }
+  } else {
+    for (const profile of profiles) order.push({ profile, pool: targetPool });
+  }
+
+  return order;
+}
+
+export function replaceModelArg(args: string[], model: string): string[] {
+  const out = [...args];
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] === "--model" || out[i] === "-m") {
+      if (i + 1 < out.length) out[i + 1] = model;
+      else out.push(model);
+      return out;
+    }
+    if (out[i].startsWith("--model=")) {
+      out[i] = `--model=${model}`;
+      return out;
+    }
+  }
+  out.push("--model", model);
+  return out;
+}
+
+/** Rewrite the model argument when a policy selects a pool different from the requested one. */
+export function applyPoolModel(
+  adapter: ProviderAdapter,
+  args: string[],
+  pool: string
+): string[] {
+  const model = adapter.getPoolModel?.(pool);
+  if (!model) return [...args];
+  return replaceModelArg(args, model);
 }
 
 export async function selectProfile(
@@ -18,47 +81,46 @@ export async function selectProfile(
   args: string[],
   env: NodeJS.ProcessEnv,
   mode: "auto" | "round-robin" | string = "auto",
-  excludeProfiles: string[] = []
+  excludeCandidates: string[] = [],
+  policy: RoutingPolicy = getRoutingPolicy()
 ): Promise<RoutingDecision & { allCooldown?: boolean }> {
   const targetPool = adapter.resolveTargetPool(args, env);
   const allProfiles = listProfiles(adapter);
-  const profiles = allProfiles.filter((p) => !excludeProfiles.includes(p));
 
-  if (profiles.length === 0) {
-    if (allProfiles.length === 0) {
-      throw new Error(
-        `No profiles found for provider '${adapter.id}' at ${adapter.profilesBaseDir}`
-      );
-    }
-    return {
-      profile: allProfiles[0],
-      targetPool,
-      reason: "All profiles excluded; fallback to primary",
-      allCooldown: true
-    };
+  if (allProfiles.length === 0) {
+    throw new Error(
+      `No profiles found for provider '${adapter.id}' at ${adapter.profilesBaseDir}`
+    );
   }
 
-  // 1. Explicit profile request
+  // 1. Explicit profile request / environment override bypass the policy ordering.
   if (mode !== "auto" && mode !== "round-robin" && mode !== "rr") {
-    if (profiles.includes(mode)) {
-      return { profile: mode, targetPool, reason: "Explicit selection" };
+    if (allProfiles.includes(mode)) {
+      return { profile: mode, targetPool, pool: targetPool, reason: "Explicit selection" };
     }
   }
 
   const envProfile = env.AGENT_MUX_PROFILE;
-  if (envProfile && profiles.includes(envProfile)) {
-    return { profile: envProfile, targetPool, reason: "Environment override" };
+  if (envProfile && allProfiles.includes(envProfile)) {
+    return { profile: envProfile, targetPool, pool: targetPool, reason: "Environment override" };
   }
 
-  // 2. Evaluate quota and cooldown for all candidate profiles
+  // 2. Build the policy-ordered candidate matrix and evaluate each `(profile, pool)`.
+  const otherPools = (adapter.getSupportedPools?.() ?? []).filter((p) => p !== targetPool);
+  const order = buildCandidateOrder(allProfiles, targetPool, otherPools, policy);
+  const excluded = new Set(excludeCandidates);
+  const quotaCache = new Map<string, PoolQuota[]>();
   const candidates: CandidateStatus[] = [];
 
-  for (const prof of profiles) {
-    // Check persisted cooldown first
-    const cd = checkCooldown(adapter.id, prof, targetPool);
+  for (const { profile: prof, pool } of order) {
+    if (excluded.has(candidateKey(prof, pool))) continue;
+
+    // Persisted cooldowns always gate selection: provider:profile:pool.
+    const cd = checkCooldown(adapter.id, prof, pool);
     if (cd.cooling) {
       candidates.push({
         profile: prof,
+        pool,
         isHealthy: false,
         remainingSec: cd.remainingSec ?? 3600,
         reason: `Active cooldown (${cd.remainingSec}s remaining)`
@@ -66,40 +128,44 @@ export async function selectProfile(
       continue;
     }
 
-    // Check live provider quota status
-    const quotas = await adapter.getQuotaStatus(prof);
-    const poolQuota = quotas.find((q) => q.pool === targetPool);
+    let quotas = quotaCache.get(prof);
+    if (!quotas) {
+      quotas = await adapter.getQuotaStatus(prof);
+      quotaCache.set(prof, quotas);
+    }
+    const poolQuota = quotas.find((q) => q.pool === pool);
 
-    if (poolQuota) {
-      if (poolQuota.state === "READY") {
-        candidates.push({
-          profile: prof,
-          isHealthy: true,
-          remainingSec: 0,
-          reason: `Healthy quota in pool '${targetPool}'`
-        });
-      } else {
-        const rem = poolQuota.remainingSeconds ?? 3600;
-        candidates.push({
-          profile: prof,
-          isHealthy: false,
-          remainingSec: rem,
-          reason: `Quota ${poolQuota.state} (${poolQuota.details || `${rem}s remaining`})`
-        });
-      }
-    } else {
+    if (!poolQuota) {
       candidates.push({
         profile: prof,
+        pool,
         isHealthy: true,
         remainingSec: 0,
         reason: "No quota limits reported"
+      });
+    } else if (poolQuota.state === "READY") {
+      candidates.push({
+        profile: prof,
+        pool,
+        isHealthy: true,
+        remainingSec: 0,
+        reason: `Healthy quota in pool '${pool}'`
+      });
+    } else {
+      const rem = poolQuota.remainingSeconds ?? 3600;
+      candidates.push({
+        profile: prof,
+        pool,
+        isHealthy: false,
+        remainingSec: rem,
+        reason: `Quota ${poolQuota.state} (${poolQuota.details || `${rem}s remaining`})`
       });
     }
   }
 
   const healthy = candidates.filter((c) => c.isHealthy);
 
-  // 3. Healthy candidates available
+  // 3. Healthy candidates available: pick the first in policy order.
   if (healthy.length > 0) {
     if (mode === "round-robin" || mode === "rr") {
       const muxHome = getAgentMuxHome();
@@ -118,31 +184,54 @@ export async function selectProfile(
       const decision = {
         profile: chosen.profile,
         targetPool,
-        reason: `Round-robin rotation (${chosen.profile})`
+        pool: chosen.pool,
+        reason: `Round-robin rotation (${chosen.profile}/${chosen.pool})`
       };
-      logMuxMessage("ROUTER", `Selected ${decision.profile} for pool ${targetPool} (${decision.reason})`);
+      logMuxMessage(
+        "ROUTER",
+        `Selected ${decision.profile}/${decision.pool} for pool ${targetPool} [${policy}] (${decision.reason})`
+      );
       return decision;
     }
 
+    const chosen = healthy[0];
     const decision = {
-      profile: healthy[0].profile,
+      profile: chosen.profile,
       targetPool,
-      reason: healthy[0].reason
+      pool: chosen.pool,
+      reason: chosen.reason
     };
-    logMuxMessage("ROUTER", `Selected ${decision.profile} for pool ${targetPool} (${decision.reason})`);
+    logMuxMessage(
+      "ROUTER",
+      `Selected ${decision.profile}/${decision.pool} for pool ${targetPool} [${policy}] (${decision.reason})`
+    );
     return decision;
   }
 
-  // 4. All candidate profiles are in cooldown/limit
+  // 4. Every candidate in the configured order is tried, cooled, or excluded: HALT.
+  if (candidates.length === 0) {
+    return {
+      profile: allProfiles[0],
+      targetPool,
+      pool: targetPool,
+      reason: `All candidates already tried (policy: ${policy})`,
+      allCooldown: true
+    };
+  }
+
   candidates.sort((a, b) => a.remainingSec - b.remainingSec);
   const bestCandidate = candidates[0];
 
   const decision = {
     profile: bestCandidate.profile,
     targetPool,
-    reason: `All profiles in cooldown; selected shortest wait (${bestCandidate.remainingSec}s on ${bestCandidate.profile})`,
+    pool: bestCandidate.pool,
+    reason: `All candidates in cooldown; selected shortest wait (${bestCandidate.remainingSec}s on ${bestCandidate.profile}/${bestCandidate.pool})`,
     allCooldown: true
   };
-  logMuxMessage("ROUTER", `Fallback selection (ALL COOLDOWN): ${decision.profile} for pool ${targetPool} (${decision.reason})`);
+  logMuxMessage(
+    "ROUTER",
+    `Fallback selection (ALL COOLDOWN) [${policy}]: ${decision.profile}/${decision.pool} (${decision.reason})`
+  );
   return decision;
 }

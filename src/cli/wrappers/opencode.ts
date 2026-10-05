@@ -1,5 +1,5 @@
 import { getProviderAdapter } from "../../providers/index.js";
-import { selectProfile } from "../../core/router.js";
+import { selectProfile, applyPoolModel } from "../../core/router.js";
 import { runSupervisor } from "../../core/supervisor.js";
 import { spawn } from "node:child_process";
 
@@ -35,11 +35,13 @@ async function main() {
   }
 
   const decision = await selectProfile(adapter, cmdArgs, process.env, mode);
+  const execArgs = applyPoolModel(adapter, cmdArgs, decision.pool);
 
   if (isStream) {
     const code = await runSupervisor({
       adapter,
       initialProfile: decision.profile,
+      initialPool: decision.pool,
       binaryPath: adapter.defaultBinaryPath,
       args: cmdArgs
     });
@@ -50,11 +52,11 @@ async function main() {
     let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
 
     if (adapter.prepareExecution) {
-      execTarget = adapter.prepareExecution(decision.profile, cmdArgs, process.env, isolationMode);
+      execTarget = adapter.prepareExecution(decision.profile, execArgs, process.env, isolationMode);
     } else {
       execTarget = {
         binary: adapter.defaultBinaryPath,
-        args: cmdArgs,
+        args: execArgs,
         env: {
           ...process.env,
           HOME: profDir

@@ -310,6 +310,35 @@ agent-mux config set isolation_mode scoped
 agent-mux config set isolation_mode home
 ```
 
+### Failover Policy (`routingPolicy`)
+
+Controls the order in which candidate `(profile, pool)` pairs are tried when a turn hits a `429` / quota exhaustion. The requested pool is the **target pool** (derived from `--model`, or `AGY_TARGET_POOL`); the other pool(s) come from the provider's supported pools (`adapter.getSupportedPools()`).
+
+| Policy | Ordering | Behavior |
+| :--- | :--- | :--- |
+| `pool-strict` (default) | `A1:target -> A2:target -> HALT` | Exhausts the target pool across every profile, then halts. No model drift or cost variance. |
+| `pool-spillover` | `[A1:target -> A2:target] -> [A1:other -> A2:other] -> HALT` | Exhausts the target pool across all profiles, then falls back to the other pool(s) across all profiles before halting. |
+| `account-first` | `A1:target -> A1:other -> A2:target -> A2:other -> HALT` | Preserves profile/`$HOME` and cache locality by trying the other pool on the same profile before hopping accounts. |
+
+Concrete example with target `gemini` and other pool `claude`:
+
+| Policy | Order |
+| :--- | :--- |
+| `pool-strict` | `primary:gemini -> secondary:gemini -> HALT` |
+| `pool-spillover` | `primary:gemini -> secondary:gemini -> primary:claude -> secondary:claude -> HALT` |
+| `account-first` | `primary:gemini -> primary:claude -> secondary:gemini -> secondary:claude -> HALT` |
+
+Persisted cooldowns are keyed `provider:profile:pool` and gate every candidate, so a profile that is cooling down in one pool can still serve another pool. Once every candidate in the configured order has been tried or is cooling down, the supervisor halts instead of flapping. When a policy selects a pool other than the requested one, the supervisor rewrites `--model` to that pool's fallback model and logs the profile + model it switched to.
+
+```bash
+# Inspect / change the active policy
+agent-mux config get routingPolicy
+agent-mux config set routingPolicy account-first
+
+# One-off environment override
+AGENT_MUX_ROUTING_POLICY=pool-spillover agy -p "echo hi"
+```
+
 ### Environment Variables
 
 | Variable | Description | Default |
@@ -317,6 +346,7 @@ agent-mux config set isolation_mode home
 | `AGENT_MUX_HOME` | Custom base directory for profiles and state | `~/.agent-mux` |
 | `AGENT_MUX_ISOLATION_MODE` | Overrides `isolation_mode` (`home` or `scoped`) | Config file / `home` |
 | `AGENT_MUX_SURFACE_ACCOUNT` | Overrides `surface_account` mode (`none`, `tool`, `message`, `both`) | Config file / `none` |
+| `AGENT_MUX_ROUTING_POLICY` | Overrides `routingPolicy` (`pool-strict`, `pool-spillover`, `account-first`) | Config file / `pool-strict` |
 | `AGENT_MUX_PROFILE` | Forces execution to a specific account profile | Auto-routed |
 | `AGY_TARGET_POOL` | Overrides target pool selection (`gemini` or `claude`) | Derived from `--model` |
 

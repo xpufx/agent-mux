@@ -75,6 +75,12 @@ export class AntigravityAdapter implements ProviderAdapter {
     return ["gemini", "claude"];
   }
 
+  getPoolModel(pool: string): string | undefined {
+    if (pool === "claude") return "claude-sonnet-5-5-low";
+    if (pool === "gemini") return "gemini-3.8-flash-low";
+    return undefined;
+  }
+
   prepareExecution(
     profile: string,
     args: string[],

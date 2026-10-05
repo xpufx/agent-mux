@@ -9,7 +9,7 @@ import {
   type SurfaceAccountMode
 } from "./config.js";
 import { recordCooldown, logMuxMessage } from "./state.js";
-import { selectProfile } from "./router.js";
+import { selectProfile, candidateKey, applyPoolModel } from "./router.js";
 
 export function isQuotaError(text: unknown): boolean {
   if (!text) return false;
@@ -58,6 +58,7 @@ export function parseResetDurationSeconds(text: string): number {
 export interface SupervisorOptions {
   adapter: ProviderAdapter;
   initialProfile: string;
+  initialPool?: string;
   binaryPath: string;
   args: string[];
   env?: NodeJS.ProcessEnv;
@@ -111,6 +112,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   const surfaceMode = options.surfaceAccount ?? getSurfaceAccountMode();
   const targetPool = adapter.resolveTargetPool(args, options.env || process.env);
   let currentProfile = options.initialProfile;
+  // The requested pool stays fixed for the whole session so the policy candidate
+  // matrix is always built against the original request, not the current fallback.
+  let currentPool = options.initialPool || targetPool;
+  let currentArgs = currentPool !== targetPool ? applyPoolModel(adapter, args, currentPool) : [...args];
   let conversationId: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
@@ -126,7 +131,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   const killedChildPids = new Set<number>();
   let isRelaunching = false;
   let relaunchCount = 0;
-  const triedProfiles = new Set<string>([currentProfile]);
+  const triedCandidates = new Set<string>([candidateKey(currentProfile, currentPool)]);
 
   // Turn state
   let turnSurfaced = false;
@@ -154,7 +159,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     const profDir = ensureProfile(adapter, prof);
     const isolationMode = getIsolationMode();
 
-    const finalArgs = [...args];
+    const finalArgs = [...currentArgs];
     if (conversationId && !finalArgs.includes("--conversation")) {
       finalArgs.push("--conversation", conversationId);
     }
@@ -210,8 +215,8 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         turnMessagePrefixed = false;
         turnHadOutput = false;
         relaunchCount = 0;
-        triedProfiles.clear();
-        triedProfiles.add(currentProfile);
+        triedCandidates.clear();
+        triedCandidates.add(candidateKey(currentProfile, currentPool));
       }
     } catch {}
 
@@ -236,7 +241,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   process.on("SIGTERM", onSigTerm);
 
   return new Promise<number>((resolve) => {
-    function attachStdoutListener(proc: ChildProcess, stderrLines: string[], prof: string) {
+    function attachStdoutListener(proc: ChildProcess, stderrLines: string[], prof: string, pool: string) {
       const rl = readline.createInterface({ input: proc.stdout! });
 
       rl.on("line", async (line) => {
@@ -274,7 +279,8 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               hadFailover = false;
               failoverPrevProfile = null;
               relaunchCount = 0;
-              triedProfiles.clear();
+              triedCandidates.clear();
+              triedCandidates.add(candidateKey(currentProfile, currentPool));
             }
           } else if (eventType === "error" && isQuotaError(parsedFrame.error)) {
             quotaDetected = true;
@@ -283,7 +289,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         } catch {}
 
         if (quotaDetected) {
-          await handleRelaunch("Quota exhausted", prof, errorDetails, line);
+          await handleRelaunch("Quota exhausted", prof, pool, errorDetails, line);
           return;
         }
 
@@ -333,7 +339,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         // Check if process crashed due to quota error during active turn
         const crashLine = isProcessCrashQuotaError(stderrLines);
         if (lastUserMessage && crashLine) {
-          await handleRelaunch("Process exited with quota limit", prof, crashLine);
+          await handleRelaunch("Process exited with quota limit", prof, pool, crashLine);
           return;
         }
 
@@ -346,30 +352,32 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     async function handleRelaunch(
       reason: string,
       failedProfile: string,
+      failedPool: string,
       errorDetails?: string,
       rawErrorLine?: string
     ) {
       if (isRelaunching) return;
 
       const durSec = parseResetDurationSeconds(errorDetails || "");
-      logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${targetPool}'): ${reason} | details: ${errorDetails}`);
-      recordCooldown(adapter.id, failedProfile, targetPool, durSec, errorDetails || reason);
+      logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails}`);
+      recordCooldown(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
+      triedCandidates.add(candidateKey(failedProfile, failedPool));
 
-      // Check if a healthy fallback exists
+      // Check if a healthy fallback exists in the policy-ordered candidate matrix
       const decision = await selectProfile(
         adapter,
         args,
         options.env || process.env,
         "auto",
-        Array.from(triedProfiles)
+        Array.from(triedCandidates)
       );
 
       // If all candidates are in cooldown or already tried, STOP. Do not flap!
-      if (decision.allCooldown || triedProfiles.has(decision.profile)) {
-        logMuxMessage("SUPERVISOR", `All candidates for pool '${targetPool}' in cooldown or already tried. Stopping failover.`);
+      if (decision.allCooldown || triedCandidates.has(candidateKey(decision.profile, decision.pool))) {
+        logMuxMessage("SUPERVISOR", `All candidates for requested pool '${targetPool}' in cooldown or already tried. Stopping failover.`);
         process.stderr.write(
-          `\n\x1b[31;1m[agent-mux] QUOTA EXHAUSTED: ${reason} on ${failedProfile} (pool: ${targetPool}).\x1b[0m\n` +
-          `\x1b[33mAll configured profiles for '${targetPool}' are currently in cooldown or rate-limited.\x1b[0m\n` +
+          `\n\x1b[31;1m[agent-mux] QUOTA EXHAUSTED: ${reason} on ${failedProfile} (pool: ${failedPool}).\x1b[0m\n` +
+          `\x1b[33mAll candidates in the configured failover order are currently in cooldown or rate-limited.\x1b[0m\n` +
           `\x1b[90mSuggested actions:\x1b[0m\n` +
           `  1. Check quota recovery:   \x1b[36magent-mux status ${adapter.id}\x1b[0m\n` +
           `  2. View active cooldowns:  \x1b[36magent-mux cooldowns\x1b[0m\n` +
@@ -389,12 +397,23 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       relaunchCount++;
 
       const prevProf = failedProfile;
+      const prevPool = failedPool;
       const nextProf = decision.profile;
-      triedProfiles.add(nextProf);
+      const nextPool = decision.pool;
+      triedCandidates.add(candidateKey(nextProf, nextPool));
 
-      logMuxMessage("SUPERVISOR", `Failing over from '${prevProf}' to '${nextProf}' for pool '${targetPool}'`);
+      // Only rewrite the model when the policy spills over into a different pool.
+      if (nextPool !== currentPool) {
+        currentArgs = nextPool === targetPool ? [...args] : applyPoolModel(adapter, args, nextPool);
+      }
+
+      const appliedModel = adapter.getPoolModel?.(nextPool);
+      logMuxMessage(
+        "SUPERVISOR",
+        `Failing over from '${prevProf}' (pool ${prevPool}) to '${nextProf}' (pool ${nextPool}${appliedModel ? `, model ${appliedModel}` : ""})`
+      );
       process.stderr.write(
-        `\n[agent-mux] ${reason} on ${prevProf} (pool: ${targetPool}). Automatically switching to healthy profile: ${nextProf}...\n`
+        `\n[agent-mux] ${reason} on ${prevProf} (pool: ${prevPool}). Automatically switching to healthy profile: ${nextProf} (pool: ${nextPool})...\n`
       );
 
       // Kill previous child
@@ -406,6 +425,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       }
 
       currentProfile = nextProf;
+      currentPool = nextPool;
       hadFailover = true;
       failoverPrevProfile = prevProf;
 
@@ -436,7 +456,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               }
 
               // Hook normal stdout listener
-              attachStdoutListener(newChild, newSpawn.stderrLines, currentProfile);
+              attachStdoutListener(newChild, newSpawn.stderrLines, currentProfile, currentPool);
               return;
             }
           } catch {}
@@ -444,6 +464,6 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       });
     }
 
-    attachStdoutListener(child!, activeChildStderr, currentProfile);
+    attachStdoutListener(child!, activeChildStderr, currentProfile, currentPool);
   });
 }
