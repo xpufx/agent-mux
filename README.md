@@ -48,6 +48,16 @@ Clients (Paseo, Terminal, Automation)
 
 ---
 
+## Use case
+
+Use case:   agent-mux is ideal for CLI coding agents that do not provide an API key or other mechanism that can be incorporated into a regular AI router. For example, with the default configuration, Antigravity CLI (agy) only allows one session to be logged in at a time and uses the same HOME for everything. When juggling quotas and cooldowns this becomes problematic. 
+
+agent-mux automatically checks all configured profiles and determines their quota status. The included optional supervisor and router watches the agent's stream and dynamically and automatically routes inference calls to the profile that is available.
+
+The included wrapper scripts (if you run install.sh) mean you do not need to change the cli's execution path or name when using in tools like Paseo. It will keep calling one CLI which will now automatically route to where it's supposed to. Alternatively you can configure your agent fleet tool to register providers separately and have them ready to go, changing the model manually as necessary.
+
+---
+
 ## Directory Structure
 
 ```text
