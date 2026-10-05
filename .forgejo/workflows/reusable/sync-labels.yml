@@ -1,0 +1,90 @@
+name: Reusable label synchronization
+
+on:
+  workflow_call:
+    inputs:
+      forgejo_hostname:
+        description: Forgejo hostname accepted by teax (for example forge.example.com)
+        required: true
+        type: string
+      overlay_path:
+        description: Path in the consumer repository to its JSON overlay manifest
+        required: false
+        default: .forgejo/labels-overlay.json
+        type: string
+      platform_ref:
+        description: Immutable platform tag or commit containing the manifest and synchronizer
+        required: true
+        type: string
+      dry_run:
+        description: Print the reconciliation plan without changing labels
+        required: false
+        default: false
+        type: boolean
+      image:
+        description: Job container image (canonical runner-containers build image)
+        required: false
+        default: forge.mrs.uppidi.com/oktay/runner-containers/ubuntu-podman-builder:latest
+        type: string
+      check:
+        description: Fail when synchronization would change labels
+        required: false
+        default: false
+        type: boolean
+# Consumers must grant only this permission at the call site. The synchronizer
+# never deletes labels and does not read or write issue labels.
+permissions:
+  issues: write
+
+jobs:
+  synchronize:
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ inputs.image }}
+    steps:
+      - name: Report runner diagnostics
+        if: always()
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          runner_host="${XP_RUNNER_HOST:-<unset>}"
+          printf 'Runner OS: %s\nRunner architecture: %s\nRunner host: %s\n' "$RUNNER_OS" "$RUNNER_ARCH" "$runner_host"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf "## Runner diagnostics\n\n- OS: \`%s\`\n- Architecture: \`%s\`\n- Host: \`%s\`\n" "$RUNNER_OS" "$RUNNER_ARCH" "$runner_host" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Check out consumer overlay
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check out pinned platform synchronizer
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: xpufx-org/platform
+          ref: ${{ inputs.platform_ref }}
+          token: ${{ secrets.PLATFORM_READ_TOKEN || github.token }}
+          path: .platform-label-sync
+      - name: Reconcile declared managed labels
+        env:
+          OVERLAY_PATH: ${{ inputs.overlay_path }}
+          FORGEJO_HOSTNAME: ${{ inputs.forgejo_hostname }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          CHECK: ${{ inputs.check }}
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN || secrets.PLATFORM_READ_TOKEN || secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+        run: |
+          set -eu
+          flags=''
+          [ "$DRY_RUN" = true ] && flags='--dry-run'
+          [ "$CHECK" = true ] && flags='--check'
+          python3 .platform-label-sync/scripts/forgejo-label-sync \
+            --base .platform-label-sync/forgejo/labels/base-v1.json \
+            --overlay "$OVERLAY_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --hostname "$FORGEJO_HOSTNAME" \
+            --token "$FORGEJO_TOKEN" \
+            --api-url "$API_URL" $flags
+      - name: Report failure summary
+        if: failure()
+        run: |
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf "## Label synchronization failure\n\nSynchronization step failed on \`%s\` (\`%s\`). Check runner logs for details.\n" "${RUNNER_OS:-unknown}" "${XP_RUNNER_HOST:-unset}" >> "$GITHUB_STEP_SUMMARY"
+          fi

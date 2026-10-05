@@ -1,0 +1,218 @@
+name: Reusable stale-WIP sweep
+
+# Hourly-equivalent recovery for `state/1-wip` tickets whose Forgejo
+# issue-level `updated_at` is older than `stale_wip_hours` (default: 2):
+# one marked reminder comment, then `attention/0-orchestrator`.
+#
+# Removal without DELETE: BusyBox `wget` cannot send DELETE, so this job
+# never removes `state/1-wip` directly. `state/*` is an exclusive scope, so
+# adding `state/0-triage` evicts `state/1-wip` server-side. End state matches
+# `scripts/forgejo-issues-check` (orchestrator attention, out of WIP) with
+# the lifecycle made explicit instead of left label-less. The reminder marker
+# is byte-identical to the script's, so host runs and Action runs interop.
+#
+# Host-runner constraints (same as the label-triage jobs): `runner-local-shell`
+# executes on the host, BusyBox `wget` only (`--header`, `--post-data`,
+# `-q`, `-O -`; exit status on HTTP errors is untrusted, so writes are
+# verified by re-reading). Cutoff timestamps use epoch arithmetic (`@$(( ... ))`)
+# for BusyBox `date` compatibility. For parsing, `jq` is used when present;
+# when absent, label checking falls back to substring matching (like
+# `label-triage.yml`) and candidate issue extraction falls back to `python3`.
+#
+# Forgejo runner v13 permits only inputs and outputs below workflow_call. The
+# caller forwards FORGEJO_TOKEN at its job boundary; do not add a secrets
+# block here.
+on:
+  workflow_call:
+    inputs:
+      forgejo_hostname:
+        description: Forgejo hostname (for example forge.example.com)
+        required: true
+        type: string
+      repo:
+        description: owner/name to sweep
+        required: true
+        type: string
+      stale_wip_hours:
+        description: Recover open state/1-wip issues with no update for this many hours
+        required: false
+        default: 2
+        type: number
+      dry_run:
+        description: Report recovery candidates without commenting or changing labels
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  issues: write
+
+jobs:
+  sweep:
+    name: Recover stale WIP to orchestrator triage
+    runs-on: runner-local-shell
+    steps:
+      - name: Report runner diagnostics
+        if: always()
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          runner_host="${XP_RUNNER_HOST:-<unset>}"
+          printf 'Runner OS: %s\nRunner architecture: %s\nRunner host: %s\n' "$RUNNER_OS" "$RUNNER_ARCH" "$runner_host"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf "## Runner diagnostics\n\n- OS: \`%s\`\n- Architecture: \`%s\`\n- Host: \`%s\`\n" "$RUNNER_OS" "$RUNNER_ARCH" "$runner_host" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Sweep stale WIP
+        env:
+          # The caller explicitly forwards the run token under this name.
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ inputs.repo }}
+          HOURS: ${{ inputs.stale_wip_hours }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eu
+
+          have_jq=0
+          command -v jq >/dev/null 2>&1 && have_jq=1
+          [ -n "$FORGEJO_TOKEN" ] || { echo "::error::caller did not forward FORGEJO_TOKEN"; exit 1; }
+
+          auth_header="Authorization: token ${FORGEJO_TOKEN}"
+          if command -v curl >/dev/null 2>&1; then
+            api_get() { curl -fsSL -H "$auth_header" "$1"; }
+            api_post() { curl -fsSL -X POST -H "$auth_header" -H "Content-Type: application/json" -d "$2" "$1"; }
+          elif command -v wget >/dev/null 2>&1; then
+            api_get() { wget -q -O - --header "$auth_header" "$1"; }
+            api_post() {
+              wget -q -O - --post-data "$2" \
+                --header "$auth_header" --header "Content-Type: application/json" "$1"
+            }
+          else
+            echo "::error::neither curl nor wget is available on the runner"
+            exit 1
+          fi
+          has_label() {
+            if [ "$have_jq" = 1 ]; then
+              printf '%s' "$1" | jq -e --arg label "$2" 'any(.[]; .name == $label)' >/dev/null
+            else
+              printf '%s' "$1" | grep -Fq "\"name\":\"$2\"" || printf '%s' "$1" | grep -Fq "\"name\": \"$2\""
+            fi
+          }
+          marker='<!-- forgejo-issues-check:stale-wip-reminder -->'
+          cutoff="$(date -u -d "@$(( $(date +%s) - HOURS * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Oldest-updated first: stale tickets (least recent activity) lead,
+          # so the page cut keeps them instead of dropping them.
+          issues_json="$(api_get "${API_URL}/repos/${REPO}/issues?state=open&limit=50&sort=updated&order=asc")"
+          [ -n "$issues_json" ] || { echo "::error::empty response listing issues (HTTP error or auth failure?)"; exit 1; }
+
+          if [ "$have_jq" = 1 ]; then
+            stale="$(printf '%s' "$issues_json" | jq -r --arg cutoff "$cutoff" '
+              .[] | select(.pull_request == null)
+              | . as $i
+              | (.labels | map(.name)) as $names
+              | select($names | index("state/1-wip"))
+              | select((($names | index("flag/stop-work")) // null) == null)
+              | select((($names | index("flag/wont-do")) // null) == null)
+              | select((($names | index("attention/3-ignore")) // null) == null)
+              | select((($names | index("attention/2-ignore")) // null) == null)
+              | select((($names | index("state/4-done")) // null) == null)
+              | select(.updated_at < $cutoff)
+              | "\(.number)\t\(.title)"')"
+          elif command -v python3 >/dev/null 2>&1; then
+            stale="$(printf '%s' "$issues_json" | python3 -c 'import sys, textwrap; exec(textwrap.dedent("""
+              import sys, json
+
+              cutoff = sys.argv[1]
+              try:
+                  issues = json.load(sys.stdin)
+              except Exception:
+                  issues = []
+
+              skip_labels = {
+                  "flag/stop-work",
+                  "flag/wont-do",
+                  "attention/3-ignore",
+                  "attention/2-ignore",
+                  "state/4-done",
+              }
+
+              for issue in issues:
+                  if not isinstance(issue, dict):
+                      continue
+                  if issue.get("pull_request") is not None:
+                      continue
+                  if issue.get("state") not in (None, "open"):
+                      continue
+                  labels = {l.get("name") for l in issue.get("labels", []) if isinstance(l, dict)}
+                  if "state/1-wip" not in labels:
+                      continue
+                  if labels & skip_labels:
+                      continue
+                  updated_at = issue.get("updated_at")
+                  if not updated_at or updated_at >= cutoff:
+                      continue
+                  num = issue.get("number")
+                  title = issue.get("title", "")
+                  print(f"{num}\t{title}")
+            """))' "$cutoff")"
+          else
+            echo "::error::jq or python3 is required for the multi-issue sweep"
+            exit 1
+          fi
+          if [ -z "$stale" ]; then
+            echo "no stale WIP in ${REPO} past ${HOURS}h"
+            exit 0
+          fi
+
+          recovered=0
+          total=0
+          results="$(mktemp)"
+          printf '%s\n' "$stale" | while IFS="$(printf '\t')" read -r num title; do
+            comments="$(api_get "${API_URL}/repos/${REPO}/issues/${num}/comments")"
+            if printf '%s' "$comments" | grep -Fq "$marker"; then
+              :
+            elif [ "$DRY_RUN" = true ]; then
+              echo "would remind #${num}: ${title}"
+            else
+              body="$(printf '{"body":"WIP has had no update past the configured timeout; returning it to orchestrator triage to check status, ownership, and next action.\\n\\n%s"}' "$marker")"
+              api_post "${API_URL}/repos/${REPO}/issues/${num}/comments" "$body" >/dev/null
+              echo "reminded #${num}: ${title}"
+            fi
+            if [ "$DRY_RUN" = true ]; then
+              echo "would recover #${num}: ${title}"
+              printf 'pending\t%s\t%s\n' "$num" "$title" >> "$results"
+              continue
+            fi
+            # Two adds, no DELETE: `attention/*` exclusivity evicts any other
+            # attention label; `state/*` exclusivity evicts `state/1-wip`
+            # itself. Writes are verified by re-reading below.
+            api_post "${API_URL}/repos/${REPO}/issues/${num}/labels" '{"labels":["attention/0-orchestrator"]}' >/dev/null
+            api_post "${API_URL}/repos/${REPO}/issues/${num}/labels" '{"labels":["state/0-triage"]}' >/dev/null
+            labels_json="$(api_get "${API_URL}/repos/${REPO}/issues/${num}/labels")"
+            if has_label "$labels_json" "attention/0-orchestrator" && ! has_label "$labels_json" "state/1-wip"; then
+              echo "recovered #${num}: ${title}"
+              printf 'recovered\t%s\t%s\n' "$num" "$title" >> "$results"
+            else
+              echo "::error::recovery of #${num} did not land (labels not as expected)"
+              exit 1
+            fi
+          done
+          # The loop above runs in a subshell (piped input), so counts are
+          # derived from its result file instead of shell variables.
+          total="$(grep -c . "$results" || true)"
+          recovered="$(grep -c '^recovered' "$results" || true)"
+          mode="recovered"
+          [ "$DRY_RUN" = true ] && mode="would recover"
+          echo "stale WIP in ${REPO}: ${mode} ${recovered}/${total} past ${HOURS}h"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf '## Stale-WIP sweep `%s`\n\n%s %s/%s past %sh\n\n' "$REPO" "$mode" "$recovered" "$total" "$HOURS"
+              while IFS="$(printf '\t')" read -r status num title; do
+                [ -n "$num" ] || continue
+                printf -- '- #%s %s (%s)\n' "$num" "$title" "$status"
+              done < "$results"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          rm -f "$results"

@@ -1,0 +1,118 @@
+name: Base maintenance caller
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the label reconciliation plan without changing labels
+        required: false
+        default: false
+        type: boolean
+      check:
+        description: Fail when reconciliation would change labels
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync-labels:
+    uses: ./.forgejo/workflows/reusable/sync-labels.yml
+    with:
+      forgejo_hostname: forge.mrs.uppidi.com
+      overlay_path: .forgejo/labels-overlay.json
+      # Consumer repositories should pin this to an immutable platform tag or
+      # commit. `main` is the scaffold default so onboarding works immediately.
+      platform_ref: main
+      dry_run: ${{ inputs.dry_run || false }}
+      check: ${{ inputs.check || false }}
+    # This mapping is valid at the caller job.  Do not add workflow_call.secrets
+    # to reusable/sync-labels.yml on runner v13.
+    secrets:
+      PLATFORM_READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      issues: write
+
+  notify-failure:
+    name: Report maintenance failure
+    needs: [sync-labels]
+    if: ${{ always() && needs.sync-labels.result == 'failure' }}
+    runs-on: runner-local-shell
+    permissions:
+      issues: write
+    steps:
+      - name: Report runner diagnostics
+        if: always()
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          runner_host="${XP_RUNNER_HOST:-<unset>}"
+          printf 'Runner OS: %s\nRunner architecture: %s\nRunner host: %s\n' "$RUNNER_OS" "$RUNNER_ARCH" "$runner_host"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf "## Runner diagnostics\n\n- OS: \`%s\`\n- Architecture: \`%s\`\n- Host: \`%s\`\n" "$RUNNER_OS" "$RUNNER_ARCH" "$runner_host" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Notify failure
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -eu
+          [ -n "$FORGEJO_TOKEN" ] || { echo "::error::FORGEJO_TOKEN is missing"; exit 1; }
+
+          auth_header="Authorization: token ${FORGEJO_TOKEN}"
+          if command -v curl >/dev/null 2>&1; then
+            api_get() { curl -fsSL -H "$auth_header" "$1"; }
+            api_post() { curl -fsSL -X POST -H "$auth_header" -H "Content-Type: application/json" -d "$2" "$1"; }
+          elif command -v wget >/dev/null 2>&1; then
+            api_get() { wget -q -O - --header "$auth_header" "$1"; }
+            api_post() {
+              wget -q -O - --post-data "$2" \
+                --header "$auth_header" --header "Content-Type: application/json" "$1"
+            }
+          else
+            echo "::error::neither curl nor wget is available on the runner"
+            exit 1
+          fi
+
+          run_url="${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
+          echo "::error::Base maintenance (sync-labels) failed in run ${run_url}"
+
+          have_jq=0
+          command -v jq >/dev/null 2>&1 && have_jq=1
+
+          issues_json="$(api_get "${API_URL}/repos/${REPO}/issues?state=open&limit=50")"
+          target_issue=""
+          if [ "$have_jq" = 1 ]; then
+            target_issue="$(printf '%s' "$issues_json" | jq -r '[.[] | select(.pull_request == null) | select(.title | test("sync-labels failing|label synchronization failed"; "i"))] | first | .number // empty')"
+          fi
+
+          if [ -n "$target_issue" ]; then
+            comment_body="$(printf '{"body":"⚠️ **Scheduled base maintenance failed**\\n\\n- Run: [%s](%s)\\n- Commit: `%s`\\n- Timestamp: `%s`"}' "Run #${RUN_ID}" "${run_url}" "${GITHUB_SHA:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+            api_post "${API_URL}/repos/${REPO}/issues/${target_issue}/comments" "$comment_body" >/dev/null
+            echo "Notified existing issue #${target_issue}"
+          else
+            issue_title="bug(actions): scheduled label synchronization failed on ${REPO}"
+            issue_body="### Summary\\nScheduled base-maintenance run failed: [Run #${RUN_ID}](${run_url}).\\n\\n- Commit: \`${GITHUB_SHA:-unknown}\`\\n- Time: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
+            payload="$(printf '{"title":"%s","body":"%s"}' "$issue_title" "$issue_body")"
+            new_issue_resp="$(api_post "${API_URL}/repos/${REPO}/issues" "$payload")"
+            new_issue_num=""
+            if [ "$have_jq" = 1 ]; then
+              new_issue_num="$(printf '%s' "$new_issue_resp" | jq -r '.number // empty')"
+            fi
+            if [ -z "$new_issue_num" ]; then
+              new_issue_num="$(printf '%s' "$new_issue_resp" | sed -n 's/.*"number":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+            fi
+            if [ -n "$new_issue_num" ]; then
+              api_post "${API_URL}/repos/${REPO}/issues/${new_issue_num}/labels" \
+                '{"labels":["attention/0-orchestrator","kind/bug","priority/1-high"]}' >/dev/null
+            else
+              echo "::warning::created failure issue but could not parse its number to attach labels"
+            fi
+            echo "Created new failure issue for run #${RUN_ID}"
+          fi
