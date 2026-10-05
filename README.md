@@ -87,6 +87,31 @@ The included wrapper scripts (if you run install.sh) mean you do not need to cha
 
 ---
 
+## Install (npm)
+
+```bash
+npm install -g @xpufx/agent-mux
+agent-mux setup
+```
+
+`agent-mux setup` is idempotent and safe to re-run. It detects the real provider
+binaries (`agy.bin`, `opencode.bin`), creates the isolated profile trees under
+`~/.agent-mux/profiles/`, links shared developer dotfiles and session history,
+and wires the `agent-mux`, `agy`, `opencode`, and `opencode-mux` wrappers into
+`~/.local/bin` (make sure it is ahead of the provider binaries on `$PATH`).
+
+Preview the changes without touching disk:
+
+```bash
+agent-mux setup --dry-run
+```
+
+No install-time scripts run automatically: published packages never install a
+`postinstall`/`preinstall` hook, so configuration only happens when you
+explicitly run `agent-mux setup`.
+
+---
+
 ## Quick Start
 
 ### 1. Build and Install

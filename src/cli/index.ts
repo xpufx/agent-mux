@@ -135,6 +135,7 @@ import {
   loadCooldowns,
   clearAllCooldowns
 } from "../core/state.js";
+import { runSetup } from "../core/setup.js";
 import { ensureProfile, removeProfile } from "../core/profiles.js";
 
 function printHelp() {
@@ -150,6 +151,7 @@ Usage:
   agent-mux profile remove <provider> <name>  Delete an account profile
   agent-mux cooldowns [list]                  View active cooldown locks and reset times
   agent-mux cooldowns clear [provider]        Clear persistent cooldown locks
+  agent-mux setup [--dry-run]                 Configure profiles and wrappers (idempotent)
   agent-mux logs [--tail <n>] [-f]            View agent-mux routing and failover logs
   agent-mux config [list|get|set]             Manage global configuration
   agent-mux run <provider> [options] [args]   Run provider binary with auto-routing
@@ -170,6 +172,7 @@ Examples:
   agent-mux agy --profile secondary           Run using a specific account profile
   agy --profile primary -p "inspect git"      Direct transparent wrapper invocation
   agent-mux profile list                      List all accounts and authenticating emails
+  agent-mux setup                             Configure profiles and transparent wrappers
   agent-mux cooldowns                         View active rate-limit locks and countdowns
 
 Isolation Modes (agent-mux config set isolation_mode <home|scoped>):
@@ -477,6 +480,12 @@ async function main() {
 
     console.error(`Unknown config action: ${sub}. Use: list, get, set`);
     process.exit(1);
+  }
+
+  if (cmd === "setup") {
+    const dryRun = args.includes("--dry-run");
+    runSetup({ dryRun });
+    return;
   }
 
   if (cmd === "status") {

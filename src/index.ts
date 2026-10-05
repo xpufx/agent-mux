@@ -5,4 +5,5 @@ export * from "./core/router.js";
 export * from "./core/supervisor.js";
 export * from "./core/config.js";
 export * from "./core/state.js";
+export * from "./core/setup.js";
 export * from "./providers/index.js";

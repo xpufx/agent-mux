@@ -1,5 +1,5 @@
 {
-  "name": "agent-mux",
+  "name": "@xpufx/agent-mux",
   "version": "0.1.0",
   "description": "High-availability multi-account multiplexer and stream supervisor for AI coding agent CLIs",
   "type": "module",
@@ -8,6 +8,14 @@
     "agent-mux": "./dist/cli.js",
     "agy-mux": "./dist/wrappers/agy.js",
     "opencode-mux": "./dist/wrappers/opencode.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "build": "node esbuild.config.mjs",
