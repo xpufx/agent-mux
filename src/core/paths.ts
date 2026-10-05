@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -18,6 +19,16 @@ export function getAgentMuxHome(): string {
 
 export function getAgentProfilesDir(providerId: string): string {
   return path.join(getAgentMuxHome(), "profiles", providerId);
+}
+
+export function getAgentLogsDir(): string {
+  const dir = path.join(getAgentMuxHome(), "logs");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function getAgentLogFilePath(): string {
+  return path.join(getAgentLogsDir(), "agent-mux.log");
 }
 
 export const COMMON_DOTFILES = [

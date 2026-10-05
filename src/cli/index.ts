@@ -14,6 +14,8 @@ import {
   parseIsolationMode,
   getConfigFilePath
 } from "../core/config.js";
+import { getAgentLogFilePath } from "../core/paths.js";
+import fs from "node:fs";
 
 async function printStatus(providerId?: string) {
   const providers = providerId
@@ -148,6 +150,7 @@ Usage:
   agent-mux profile remove <provider> <name>  Delete an account profile
   agent-mux cooldowns [list]                  View active cooldown locks and reset times
   agent-mux cooldowns clear [provider]        Clear persistent cooldown locks
+  agent-mux logs [--tail <n>] [-f]            View agent-mux routing and failover logs
   agent-mux config [list|get|set]             Manage global configuration
   agent-mux run <provider> [options] [args]   Run provider binary with auto-routing
   agent-mux <provider> [args]                 Shorthand for run (e.g. agent-mux agy ...)
@@ -368,6 +371,29 @@ async function main() {
 
   if (cmd === "cooldown" || cmd === "cooldowns") {
     handleCooldownsCommand(args.slice(1));
+    return;
+  }
+
+  if (cmd === "logs" || cmd === "log") {
+    const logFile = getAgentLogFilePath();
+    if (!fs.existsSync(logFile)) {
+      console.log(`No logs found at ${logFile}`);
+      return;
+    }
+    const tailIdx = args.indexOf("--tail") !== -1 ? args.indexOf("--tail") : args.indexOf("-n");
+    const count = tailIdx !== -1 && args[tailIdx + 1] ? parseInt(args[tailIdx + 1], 10) : 50;
+    const isFollow = args.includes("-f") || args.includes("--follow");
+
+    if (isFollow) {
+      const tailProc = spawn("tail", ["-n", String(count), "-f", logFile], { stdio: "inherit" });
+      tailProc.on("close", (code) => process.exit(code ?? 0));
+      return;
+    }
+
+    const lines = fs.readFileSync(logFile, "utf-8").trim().split("\n");
+    const slice = lines.slice(-count);
+    console.log(`=== agent-mux Logs (${logFile}) ===`);
+    console.log(slice.join("\n"));
     return;
   }
 

@@ -8,20 +8,36 @@ import {
   getIsolationMode,
   type SurfaceAccountMode
 } from "./config.js";
-import { recordCooldown } from "./state.js";
+import { recordCooldown, logMuxMessage } from "./state.js";
 import { selectProfile } from "./router.js";
 
 export function isQuotaError(text: unknown): boolean {
   if (!text) return false;
   const t = String(text).toLowerCase();
+  // Must be an actual resource exhaustion or 429 status code
   return (
     t.includes("resource_exhausted") ||
     t.includes("code 429") ||
-    t.includes("quota reached") ||
-    t.includes("capacity exhausted") ||
-    t.includes("quota exceeded") ||
-    t.includes("rate_limit")
+    t.includes("status 429") ||
+    t.includes("http 429") ||
+    t.includes("err_quota_exceeded")
   );
+}
+
+export function isProcessCrashQuotaError(stderrLines: string[]): string | undefined {
+  for (const line of stderrLines) {
+    const t = line.toLowerCase();
+    // Look for structured engine crash frame or explicit 429 error report
+    if (
+      t.includes("resource_exhausted (code 429)") ||
+      t.includes("agy_error:") && t.includes("resource_exhausted") ||
+      t.includes('"status":"resource_exhausted"') ||
+      t.includes('"error_code":429')
+    ) {
+      return line;
+    }
+  }
+  return undefined;
 }
 
 export function parseResetDurationSeconds(text: string): number {
@@ -106,7 +122,8 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
   let child: ChildProcess | null = null;
   let lastUserMessage: string | null = null;
-  const recentStderr: string[] = [];
+  let activeChildStderr: string[] = [];
+  const killedChildPids = new Set<number>();
   let isRelaunching = false;
   let relaunchCount = 0;
   const triedProfiles = new Set<string>([currentProfile]);
@@ -133,7 +150,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     } catch {}
   }
 
-  function spawnChild(prof: string): ChildProcess {
+  function spawnChild(prof: string): { proc: ChildProcess; stderrLines: string[] } {
     const profDir = ensureProfile(adapter, prof);
     const isolationMode = getIsolationMode();
 
@@ -166,17 +183,20 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       stdio: ["pipe", "pipe", "pipe"]
     });
 
+    const stderrLines: string[] = [];
     proc.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       process.stderr.write(text);
-      recentStderr.push(text);
-      if (recentStderr.length > 25) recentStderr.shift();
+      stderrLines.push(text);
+      if (stderrLines.length > 25) stderrLines.shift();
     });
 
-    return proc;
+    return { proc, stderrLines };
   }
 
-  child = spawnChild(currentProfile);
+  const initialSpawn = spawnChild(currentProfile);
+  child = initialSpawn.proc;
+  activeChildStderr = initialSpawn.stderrLines;
 
   // Pipe stdin from parent to active child
   const parentStdinLines = readline.createInterface({ input: process.stdin });
@@ -185,6 +205,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       const data = JSON.parse(line);
       if (data.event === "user") {
         lastUserMessage = line;
+        activeChildStderr.length = 0; // Clear stale stderr from previous turns
         turnSurfaced = false;
         turnMessagePrefixed = false;
         turnHadOutput = false;
@@ -215,7 +236,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   process.on("SIGTERM", onSigTerm);
 
   return new Promise<number>((resolve) => {
-    function attachStdoutListener(proc: ChildProcess) {
+    function attachStdoutListener(proc: ChildProcess, stderrLines: string[], prof: string) {
       const rl = readline.createInterface({ input: proc.stdout! });
 
       rl.on("line", async (line) => {
@@ -259,15 +280,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             quotaDetected = true;
             errorDetails = String(parsedFrame.error);
           }
-        } catch {
-          if (isQuotaError(line)) {
-            quotaDetected = true;
-            errorDetails = line;
-          }
-        }
+        } catch {}
 
         if (quotaDetected) {
-          await handleRelaunch("Quota exhausted", errorDetails, line);
+          await handleRelaunch("Quota exhausted", prof, errorDetails, line);
           return;
         }
 
@@ -304,11 +320,20 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
       proc.on("close", async (code) => {
         if (isRelaunching) return;
+        if (proc.pid && killedChildPids.has(proc.pid)) return;
+
+        // Clean exit: do not attempt quota relaunch
+        if (code === 0) {
+          process.off("SIGINT", onSigInt);
+          process.off("SIGTERM", onSigTerm);
+          resolve(0);
+          return;
+        }
 
         // Check if process crashed due to quota error during active turn
-        const errLine = recentStderr.find((err) => isQuotaError(err));
-        if (lastUserMessage && errLine) {
-          await handleRelaunch("Process exited with quota limit", errLine);
+        const crashLine = isProcessCrashQuotaError(stderrLines);
+        if (lastUserMessage && crashLine) {
+          await handleRelaunch("Process exited with quota limit", prof, crashLine);
           return;
         }
 
@@ -320,13 +345,15 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
     async function handleRelaunch(
       reason: string,
+      failedProfile: string,
       errorDetails?: string,
       rawErrorLine?: string
     ) {
       if (isRelaunching) return;
 
       const durSec = parseResetDurationSeconds(errorDetails || "");
-      recordCooldown(adapter.id, currentProfile, targetPool, durSec, errorDetails || reason);
+      logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${targetPool}'): ${reason} | details: ${errorDetails}`);
+      recordCooldown(adapter.id, failedProfile, targetPool, durSec, errorDetails || reason);
 
       // Check if a healthy fallback exists
       const decision = await selectProfile(
@@ -339,8 +366,9 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
       // If all candidates are in cooldown or already tried, STOP. Do not flap!
       if (decision.allCooldown || triedProfiles.has(decision.profile)) {
+        logMuxMessage("SUPERVISOR", `All candidates for pool '${targetPool}' in cooldown or already tried. Stopping failover.`);
         process.stderr.write(
-          `\n\x1b[31;1m[agent-mux] QUOTA EXHAUSTED: ${reason} on ${currentProfile} (pool: ${targetPool}).\x1b[0m\n` +
+          `\n\x1b[31;1m[agent-mux] QUOTA EXHAUSTED: ${reason} on ${failedProfile} (pool: ${targetPool}).\x1b[0m\n` +
           `\x1b[33mAll configured profiles for '${targetPool}' are currently in cooldown or rate-limited.\x1b[0m\n` +
           `\x1b[90mSuggested actions:\x1b[0m\n` +
           `  1. Check quota recovery:   \x1b[36magent-mux status ${adapter.id}\x1b[0m\n` +
@@ -360,10 +388,11 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       isRelaunching = true;
       relaunchCount++;
 
-      const prevProf = currentProfile;
+      const prevProf = failedProfile;
       const nextProf = decision.profile;
       triedProfiles.add(nextProf);
 
+      logMuxMessage("SUPERVISOR", `Failing over from '${prevProf}' to '${nextProf}' for pool '${targetPool}'`);
       process.stderr.write(
         `\n[agent-mux] ${reason} on ${prevProf} (pool: ${targetPool}). Automatically switching to healthy profile: ${nextProf}...\n`
       );
@@ -371,6 +400,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       // Kill previous child
       if (child) {
         try {
+          if (child.pid) killedChildPids.add(child.pid);
           child.kill("SIGTERM");
         } catch {}
       }
@@ -382,8 +412,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       // Inject failover tool frame upstream immediately
       injectAccountFrame(true, prevProf);
 
-      const newChild = spawnChild(currentProfile);
+      const newSpawn = spawnChild(currentProfile);
+      const newChild = newSpawn.proc;
       child = newChild;
+      activeChildStderr = newSpawn.stderrLines;
 
       let initConsumed = false;
       const rl = readline.createInterface({ input: newChild.stdout! });
@@ -404,7 +436,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               }
 
               // Hook normal stdout listener
-              attachStdoutListener(newChild);
+              attachStdoutListener(newChild, newSpawn.stderrLines, currentProfile);
               return;
             }
           } catch {}
@@ -412,6 +444,6 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       });
     }
 
-    attachStdoutListener(child!);
+    attachStdoutListener(child!, activeChildStderr, currentProfile);
   });
 }

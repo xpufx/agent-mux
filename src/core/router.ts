@@ -4,7 +4,7 @@ import os from "node:os";
 import type { ProviderAdapter, RoutingDecision } from "../types.js";
 import { listProfiles } from "./profiles.js";
 import { getAgentMuxHome } from "./paths.js";
-import { checkCooldown } from "./state.js";
+import { checkCooldown, logMuxMessage } from "./state.js";
 
 export interface CandidateStatus {
   profile: string;
@@ -115,28 +115,34 @@ export async function selectProfile(
       try {
         fs.writeFileSync(rrFile, String((idx + 1) % healthy.length));
       } catch {}
-      return {
+      const decision = {
         profile: chosen.profile,
         targetPool,
         reason: `Round-robin rotation (${chosen.profile})`
       };
+      logMuxMessage("ROUTER", `Selected ${decision.profile} for pool ${targetPool} (${decision.reason})`);
+      return decision;
     }
 
-    return {
+    const decision = {
       profile: healthy[0].profile,
       targetPool,
       reason: healthy[0].reason
     };
+    logMuxMessage("ROUTER", `Selected ${decision.profile} for pool ${targetPool} (${decision.reason})`);
+    return decision;
   }
 
   // 4. All candidate profiles are in cooldown/limit
   candidates.sort((a, b) => a.remainingSec - b.remainingSec);
   const bestCandidate = candidates[0];
 
-  return {
+  const decision = {
     profile: bestCandidate.profile,
     targetPool,
     reason: `All profiles in cooldown; selected shortest wait (${bestCandidate.remainingSec}s on ${bestCandidate.profile})`,
     allCooldown: true
   };
+  logMuxMessage("ROUTER", `Fallback selection (ALL COOLDOWN): ${decision.profile} for pool ${targetPool} (${decision.reason})`);
+  return decision;
 }

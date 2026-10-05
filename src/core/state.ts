@@ -1,6 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
-import { getAgentMuxHome } from "./paths.js";
+import { getAgentMuxHome, getAgentLogFilePath } from "./paths.js";
+
+export function logMuxMessage(component: string, message: string, meta?: any): void {
+  try {
+    const logFile = getAgentLogFilePath();
+    const timestamp = new Date().toISOString();
+    const metaStr = meta ? ` | ${JSON.stringify(meta)}` : "";
+    fs.appendFileSync(logFile, `[${timestamp}] [${component}] ${message}${metaStr}\n`, "utf-8");
+  } catch {}
+}
 
 export interface CooldownEntry {
   provider: string;
@@ -83,6 +92,7 @@ export function recordCooldown(
 
   cooldowns[key] = entry;
   saveCooldowns(cooldowns);
+  logMuxMessage("COOLDOWN", `Recorded cooldown on ${key} for ${durationSec}s (resets at ${new Date(resetAt).toISOString()}): ${reason}`);
   return entry;
 }
 
@@ -92,6 +102,7 @@ export function clearCooldown(provider: string, profile: string, pool: string): 
   if (cooldowns[key]) {
     delete cooldowns[key];
     saveCooldowns(cooldowns);
+    logMuxMessage("COOLDOWN", `Cleared cooldown on ${key}`);
   }
 }
 

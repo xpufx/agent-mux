@@ -33,6 +33,7 @@ export class AntigravityAdapter implements ProviderAdapter {
 
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string {
     if (env.AGY_TARGET_POOL === "claude") return "claude";
+    if (env.AGY_TARGET_POOL === "gemini") return "gemini";
     let model = "";
     let prev = "";
     for (const a of args) {
@@ -42,7 +43,22 @@ export class AntigravityAdapter implements ProviderAdapter {
       }
       prev = a;
     }
-    if (model.startsWith("claude") || model.startsWith("gpt")) {
+
+    if (!model) {
+      // Check user/profile settings.json if available
+      try {
+        const settingsPath = path.join(getRealHome(), ".gemini/antigravity-cli/settings.json");
+        if (fs.existsSync(settingsPath)) {
+          const cfg = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+          if (cfg.model && typeof cfg.model === "string") {
+            model = cfg.model;
+          }
+        }
+      } catch {}
+    }
+
+    const m = model.toLowerCase();
+    if (m.startsWith("claude") || m.startsWith("gpt")) {
       return "claude";
     }
     return "gemini";
