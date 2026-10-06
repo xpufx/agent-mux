@@ -107,10 +107,30 @@ export function clearCooldown(provider: string, profile: string, pool: string): 
 }
 
 export function clearAllCooldowns(): number {
+  return clearCooldownsMatching({});
+}
+
+export interface CooldownClearFilter {
+  provider?: string;
+  profile?: string;
+  pool?: string;
+}
+
+export function clearCooldownsMatching(filter: CooldownClearFilter = {}): number {
   const cooldowns = loadCooldowns();
-  const count = Object.keys(cooldowns).length;
-  saveCooldowns({});
-  return count;
+  let cleared = 0;
+  for (const [key, entry] of Object.entries(cooldowns)) {
+    if (filter.provider !== undefined && entry.provider !== filter.provider) continue;
+    if (filter.profile !== undefined && entry.profile !== filter.profile) continue;
+    if (filter.pool !== undefined && entry.pool !== filter.pool) continue;
+    delete cooldowns[key];
+    cleared++;
+  }
+  if (cleared > 0) {
+    saveCooldowns(cooldowns);
+    logMuxMessage("COOLDOWN", `Cleared ${cleared} cooldown(s) matching ${JSON.stringify(filter)}`);
+  }
+  return cleared;
 }
 
 export function checkCooldown(

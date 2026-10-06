@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 // Workspace-scoped scratch: never touch global /tmp or the real home.
 const here = path.dirname(fileURLToPath(import.meta.url));
+fs.mkdirSync(path.join(here, "..", ".tmp"), { recursive: true });
 const tmpHome = fs.mkdtempSync(path.join(here, "..", ".tmp", "supervisor-quota-"));
 process.env.AGENT_MUX_HOME = tmpHome;
 

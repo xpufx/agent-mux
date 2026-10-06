@@ -137,7 +137,7 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
 
 import {
   loadCooldowns,
-  clearAllCooldowns
+  clearCooldownsMatching
 } from "../core/state.js";
 import { runSetup } from "../core/setup.js";
 import { ensureProfile, removeProfile } from "../core/profiles.js";
@@ -154,7 +154,7 @@ Usage:
   agent-mux profile auth <provider> <name>    Launch interactive login for a profile
   agent-mux profile remove <provider> <name>  Delete an account profile
   agent-mux cooldowns [list]                  View active cooldown locks and reset times
-  agent-mux cooldowns clear [provider]        Clear persistent cooldown locks
+  agent-mux cooldowns clear [provider] [profile] [pool]  Clear cooldown locks (scoped)
   agent-mux setup [--dry-run]                 Configure profiles and wrappers (idempotent)
   agent-mux logs [--tail <n>] [-f]            View agent-mux routing and failover logs
   agent-mux config [list|get|set]             Manage global configuration
@@ -313,7 +313,7 @@ function handleCooldownsCommand(args: string[]) {
 
 Actions:
   list                                          View active cooldown locks and reset times
-  clear [provider] [profile] [pool]             Clear all or specific persistent cooldown locks
+  clear [provider] [profile] [pool]             Clear cooldown locks (all, or scoped by provider/profile/pool)
 `);
     return;
   }
@@ -352,8 +352,14 @@ Actions:
     if (prov && prof && pool) {
       clearCooldown(prov, prof, pool);
       console.log(`\x1b[32m[✓] Cleared cooldown for ${prov}:${prof}:${pool}\x1b[0m`);
+    } else if (prov && prof) {
+      const cleared = clearCooldownsMatching({ provider: prov, profile: prof });
+      console.log(`\x1b[32m[✓] Cleared ${cleared} cooldown lock(s) for ${prov}:${prof} (all pools).\x1b[0m`);
+    } else if (prov) {
+      const cleared = clearCooldownsMatching({ provider: prov });
+      console.log(`\x1b[32m[✓] Cleared ${cleared} cooldown lock(s) for provider ${prov}.\x1b[0m`);
     } else {
-      const cleared = clearAllCooldowns();
+      const cleared = clearCooldownsMatching({});
       console.log(`\x1b[32m[✓] Cleared all active cooldown locks (${cleared} cleared).\x1b[0m`);
     }
     return;
