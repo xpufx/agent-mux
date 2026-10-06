@@ -11,29 +11,85 @@ import {
 import { recordCooldown, logMuxMessage } from "./state.js";
 import { selectProfile, candidateKey, applyPoolModel } from "./router.js";
 
+/**
+ * Extract readable text from a stream error payload. Engine frames may carry
+ * the failure as a plain string or as a structured object (e.g.
+ * `{ event: "error", error: { code: 429, message: "..." } }`); `String(obj)`
+ * would collapse those to "[object Object]" and hide the quota signal.
+ */
+export function errorTextOf(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const parts: string[] = [];
+    for (const key of [
+      "message",
+      "error",
+      "details",
+      "detail",
+      "reason",
+      "code",
+      "status",
+      "error_code"
+    ]) {
+      const v = obj[key];
+      if (typeof v === "string" || typeof v === "number") parts.push(String(v));
+    }
+    if (parts.length > 0) return parts.join(" ");
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 export function isQuotaError(text: unknown): boolean {
   if (!text) return false;
-  const t = String(text).toLowerCase();
-  // Must be an actual resource exhaustion or 429 status code
+  // Structured payloads must be matched as JSON, not "[object Object]".
+  let raw: string;
+  if (typeof text === "string") {
+    raw = text;
+  } else {
+    try {
+      raw = JSON.stringify(text) ?? "";
+    } catch {
+      raw = String(text);
+    }
+  }
+  if (!raw) return false;
+  const t = raw.toLowerCase();
+  // Must be an actual resource exhaustion / 429 / rate-limit signal.
+  // Matching runs only against error payloads (result ERROR frames,
+  // error frames, probe output, crash stderr) — never agent prose.
   return (
     t.includes("resource_exhausted") ||
+    t.includes("resource exhausted") ||
+    /\b429\b/.test(t) ||
+    t.includes("err_quota_exceeded") ||
+    t.includes("quota_exceeded") ||
+    t.includes("quota exceeded") ||
+    t.includes("quota exhausted") ||
+    t.includes("insufficient quota") ||
+    t.includes("rate limit") ||
+    t.includes("rate_limit") ||
+    t.includes("rate-limit") ||
+    t.includes("ratelimit") ||
+    t.includes("too many requests") ||
     t.includes("code 429") ||
     t.includes("status 429") ||
-    t.includes("http 429") ||
-    t.includes("err_quota_exceeded")
+    t.includes("http 429")
   );
 }
 
 export function isProcessCrashQuotaError(stderrLines: string[]): string | undefined {
+  // Same vocabulary as live-frame detection: any quota signal on stderr
+  // during an active turn means the crash was a quota failure.
   for (const line of stderrLines) {
-    const t = line.toLowerCase();
-    // Look for structured engine crash frame or explicit 429 error report
-    if (
-      t.includes("resource_exhausted (code 429)") ||
-      t.includes("agy_error:") && t.includes("resource_exhausted") ||
-      t.includes('"status":"resource_exhausted"') ||
-      t.includes('"error_code":429')
-    ) {
+    if (isQuotaError(line)) {
       return line;
     }
   }
@@ -270,7 +326,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             const res = parsedFrame.result || {};
             if (res.status === "ERROR" && isQuotaError(res.error)) {
               quotaDetected = true;
-              errorDetails = String(res.error);
+              errorDetails = errorTextOf(res.error);
             } else {
               lastUserMessage = null;
               turnSurfaced = false;
@@ -284,7 +340,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             }
           } else if (eventType === "error" && isQuotaError(parsedFrame.error)) {
             quotaDetected = true;
-            errorDetails = String(parsedFrame.error);
+            errorDetails = errorTextOf(parsedFrame.error);
           }
         } catch {}
 
