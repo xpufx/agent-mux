@@ -1,0 +1,39 @@
+# npm publish caller for the agent-mux plugin.
+#
+# Delegates the whole release to the platform reusable workflow: version bump,
+# `npm pack` staging, optional npm publish, and (when enabled) a GitHub mirror.
+# This repo publishes to npm only, so the mirror stays off.
+name: Plugin submit caller
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      npm_tag:
+        description: 'npm dist-tag for the publish step'
+        required: false
+        default: 'latest'
+        type: string
+      publish:
+        description: 'Publish the staged tarball to npm'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  submit:
+    uses: xpufx-org/platform/.forgejo/workflows/reusable/plugin-submit.yml@main
+    with:
+      plugin_path: .
+      npm_tag: ${{ inputs.npm_tag || 'latest' }}
+      publish: ${{ inputs.publish || github.ref_type == 'tag' }}
+      mirror: false
+      mirror_repo: ""
+    # Valid at the caller job. Do not add workflow_call.secrets to the
+    # reusable workflow on runner v13.
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      contents: read
