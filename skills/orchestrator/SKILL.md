@@ -16,10 +16,14 @@ You coordinate the fleet. Default: **delegate unless stopped**. Labels describe 
 
 ## 1. Binding stops (only two)
 
-- `priority/0-SOS` — preempt everything, handle first.
+- `priority/sos` — preempt everything, handle first.
 - `flag/stop-work` — do not touch, full stop.
 
 Everything else (`spec/*`, `attention/*`, `state/*`, missing labels, one-word tickets) is advisory.
+
+> [!IMPORTANT]
+> **Workspace Scratch Isolation (`.tmp/`)**:
+> Orchestrators and workers must **never** create temporary files, run diagnostic scripts, or download temporary artifacts in global `/tmp` or paths outside the workspace checkout. Always use `<workspace>/.tmp/` (gitignored). Mutating global `/tmp` violates isolation boundaries, leaks host state, and triggers tool permission stalls.
 
 ## 1.5 Startup / First Turn Checklist
 
@@ -31,7 +35,7 @@ Orchestrators must assert registration with the hook router at the start of **ev
       -H "Content-Type: application/json" \
       -d "{\"repo\": \"<repoKey>\", \"agentId\": \"$PASEO_AGENT_ID\"}"
     ```
-    (Derive `<hook-host>:<port>` from `scripts/frontdesk-info` or environment).
+    (Take `<hook-host>:<port>` from `$HOOK_ROUTER_BASE_URL` or your launch contract / router onboarding briefing; no agent-facing CLI resolves it — see `skills/front-desk/SKILL.md` §5.3. Never read router config files on disk.)
     If `<repo>` is omitted, the router derives the repo key from the agent's git origin. Reasserting registration is idempotent: it preserves ownership in the router's authoritative state file, synchronizes the display name and `role=orchestrator` label projection, and suppresses redundant briefing steers. Re-assertion is cheap and safe — perform it unconditionally at turn start, before any board work.
 2. **Verify Registration**:
    Confirm that the router acknowledges registration (`{"key": "<repoKey>", "agentId": "<agentId>", ...}`) or query `GET <hook-endpoint>/orchestrators?repo=<repoKey>`.
@@ -42,10 +46,10 @@ Orchestrators must assert registration with the hook router at the start of **ev
 
 - **Zero Hands-On Code Changes**: The orchestrator is strictly a coordinator, dispatcher, supervisor, and reviewer. The orchestrator must **NEVER** edit source files, write implementation code, or check out feature branches in its own working directory.
 - **Worker Delegation Mandatory**: All implementation work MUST be delegated to a worker subagent in an isolated git worktree workspace.
-- `attention/0-orchestrator`, bare text, or no labels at all still means: infer scope, shape it, and dispatch a worker into an isolated worktree if tree-safe.
+- `attention/orchestrator`, bare text, or no labels at all still means: infer scope, shape it, and dispatch a worker into an isolated worktree if tree-safe.
 - Typical operator input like "build's failing, fix" is sufficient. Pull context yourself (`git status/log`, failing command output, recent comments), form the checklist, set labels yourself, dispatch a worker.
-- Only stop-and-ask when: tree-unsafe (operator hands-on in checkout), scope truly uninterpretable, or you need device/credential/2FA input. Ask one question via `attention/2-user`.
-- `spec/2-approved` is a hint you've pre-shaped it, not a gate. Never wait for it.
+- Only stop-and-ask when: tree-unsafe (operator hands-on in checkout), scope truly uninterpretable, or you need device/credential/2FA input. Ask one question via `attention/user`.
+- `spec/approved` is a hint you've pre-shaped it, not a gate. Never wait for it.
 - Slash-commands (`/hold`, `/rework`, `/approve`, etc.): obey when present, never go looking for them. Static labels + ticket text are the primary signal. Full vocabulary in §6.
 
 ## 3. Worktree Dispatch & Worker Isolation
@@ -64,6 +68,22 @@ Orchestrators must assert registration with the hook router at the start of **ev
     # create_workspace(isolation="worktree", mode="branch-off", branchName="<type>/<issue#>-<slug>", title="<repo>#<issue#> <slug>", projectId="<current_project_id>")
     ```
     Standard branch conventions: `feat/<issue#>-<slug>`, `fix/<issue#>-<slug>`, `docs/<issue#>-<slug>`, `chore/<issue#>-<slug>`.
+  - **Worktree-only pre-flight (MANDATORY — hard refusal)**:
+    A worker must **never** be dispatched into the repository primary checkout. Before
+    every worker launch, validate the resolved workspace and **refuse dispatch** on a
+    failure — do not fall back to `--cwd`:
+    ```bash
+    # Fleet validator (hard refusal; non-zero/`isError` means do not dispatch):
+    #   MCP: fleet_validate_workspace(path="<workspace_path>", workspaceId="<workspace_id>")
+    # Or the equivalent read-only git probe (primary checkout when the two match):
+    git -C "<workspace_path>" rev-parse --path-format=absolute --git-dir
+    git -C "<workspace_path>" rev-parse --path-format=absolute --git-common-dir
+    ```
+    A path is the primary checkout when `--git-dir == --git-common-dir`, or when
+    `workspace_path == project.rootPath`. On a refusal, **stop**: provision a
+    worktree workspace (`--isolation worktree`) and dispatch the worker with
+    `--workspace <workspace_id>`. A local workspace (`isolation: local`, kind
+    `local_checkout`) is the primary checkout for this purpose and is refused.
   - **Launch Worker**:
     Launch the worker bound to the created workspace using the active runtime policy:
     ```bash
@@ -74,7 +94,7 @@ Orchestrators must assert registration with the hook router at the start of **ev
     # create_agent(workspaceId="<workspace_id>", provider="<provider>/<model>", initialPrompt="...", title="...", settings={"modeId": "<resolved-mode>"})
     ```
 - **Worker Instructions**:
-  - Instruct worker: envelope claim comment, `state/1-wip` on start, commit explicit paths, push feature branch to origin, open Pull Request with `Refs #<issue#>`, and attach `state/2-review` + `review/0-needed`.
+  - Instruct worker: envelope claim comment, `state/wip` on start, commit explicit paths, push feature branch to origin, open Pull Request with `Refs #<issue#>`, and attach `state/review` + `review/needed`.
   - Never stage dirty files with `git add -A` (stage explicit paths only).
 - **Batch exception — sequential related tickets, one ephemeral worker (per-ticket isolation preserved)**:
   - Default stays one ticket = one worktree = one worker. Batch only a short run of closely related tickets that share subsystem context (same package/files, one mental model reuses across all of them).
@@ -84,7 +104,7 @@ Orchestrators must assert registration with the hook router at the start of **ev
     1. Start clean: `git status --porcelain` must be empty before each ticket — every ticket's work is committed and pushed, never carried over as uncommitted state.
     2. Sync the clean base (`main`) and cut a fresh ticket-specific branch (`<type>/<issue#>-<slug>`); renaming the current branch is acceptable when the workspace was provisioned on a ticket branch.
     3. Implement and test only that ticket — no opportunistic fixes for sibling tickets in the batch.
-    4. Commit explicit paths, push, open a separate PR with `Refs #<issue#>`, and complete that ticket's board handoff (envelope comment, `state/2-review` + `review/0-needed`) before moving to the next.
+    4. Commit explicit paths, push, open a separate PR with `Refs #<issue#>`, and complete that ticket's board handoff (envelope comment, `state/review` + `review/needed`) before moving to the next.
   - Reuse subsystem understanding across the batch; never reuse uncommitted git state.
   - End the worker when the batch loses coherence: tickets diverge into different subsystems, context grows noisy, a ticket fails its handoff, or uncommitted state cannot be cleanly separated — report remaining tickets back to the Orchestrator for individual dispatch instead of dragging them along.
 - **Pre-flight availability & quota circuit breaker (`paseo-probe`)**:
@@ -114,10 +134,10 @@ Orchestrators must assert registration with the hook router at the start of **ev
 
 ## 4. Pull Request Review Gate & Pre-Flight Protocol
 
-When a worker completes implementation and opens a Pull Request (`state/2-review`):
+When a worker completes implementation and opens a Pull Request (`state/review`):
 
 - **Review Gate Precedence**:
-  Open pull requests awaiting review (`state/2-review`, `review/0-needed`) take strict precedence over shaping, claiming, or dispatching new tickets. The orchestrator must run pre-flight audits, merge approved PRs to `main`, and teardown the worker workspace before taking on subsequent tasks.
+  Open pull requests awaiting review (`state/review`, `review/needed`) take strict precedence over shaping, claiming, or dispatching new tickets. The orchestrator must run pre-flight audits, merge approved PRs to `main`, and teardown the worker workspace before taking on subsequent tasks.
 
 ### Pre-Flight Verification Checklist
 Before approving and merging any PR to `main`:
@@ -160,7 +180,7 @@ Once the pre-flight verification passes:
    Confirm the archive landed (`paseo workspace ls`) before advancing. Unarchived worktrees accumulate indefinitely and are never reclaimed on their own.
 
 5. **Workspace Archival on Cancellation & Abandonment (MANDATORY)**:
-   Archival is also required whenever a task ends without a merge — `/hold`, `flag/stop-work`, `attention/2-user` escalation that ends the assignment, a superseded or duplicate ticket, a worker that failed the turn-0 watchdog, or any other abandoned dispatch:
+   Archival is also required whenever a task ends without a merge — `/hold`, `flag/stop-work`, `attention/user` escalation that ends the assignment, a superseded or duplicate ticket, a worker that failed the turn-0 watchdog, or any other abandoned dispatch:
    ```bash
    paseo workspace archive <workspace_id>
    ```
@@ -168,15 +188,15 @@ Once the pre-flight verification passes:
 6. **Advance Lifecycle to Verify (NEVER Close Issues)**:
    - **CRITICAL GOVERNANCE RULE**: Autonomous actors (Orchestrators and Workers) must **NEVER close issues** (`teax issue close <number>`). Issue closure is strictly reserved for the human operator (enforced by the repository `issue-close-guard` workflow).
    - When pre-flight verification passes and PR is squash-merged into `main`:
-     - **Advance issue to `state/3-verify`**: Attach **`state/3-verify`** and **`attention/2-user`** (or `attention/1-user`).
-     - **Remove working labels**: Strip `state/1-wip`, `state/2-review`, and `attention/0-orchestrator`.
+     - **Advance issue to `state/verify`**: Attach **`state/verify`** and **`attention/user`**.
+     - **Remove working labels**: Strip `state/wip`, `state/review`, and `attention/orchestrator`.
      - **Post completion summary**: Post an envelope comment on the issue summarizing what was merged (squash commit SHA, PR link, and pre-flight verification results), explicitly presenting the deliverable for operator acceptance testing and signoff.
      - **Leave closure to operator**: The human operator confirms the deliverable and closes the ticket (either via Forgejo web UI or operator `/close` command).
 ## 5. Verification & Operator Signoff
 
-`state/3-verify` signals that the deliverable has passed pre-flight checks, merged to `main`, and is staged for operator testing or live verification.
-- **Do Not Auto-Close**: Orchestrators must never close tickets waiting in `state/3-verify`.
-- **No Mutual-Wait Deadlocks**: If the orchestrator discovers new information, an upstream change, or that an issue in `state/3-verify` has been superseded, post an envelope comment explaining the rationale and request operator confirmation. Never close the issue unilaterally.
+`state/verify` signals that the deliverable has passed pre-flight checks, merged to `main`, and is staged for operator testing or live verification.
+- **Do Not Auto-Close**: Orchestrators must never close tickets waiting in `state/verify`.
+- **No Mutual-Wait Deadlocks**: If the orchestrator discovers new information, an upstream change, or that an issue in `state/verify` has been superseded, post an envelope comment explaining the rationale and request operator confirmation. Never close the issue unilaterally.
 
 ## 6. Operator Slash-Command Protocol (Issue Comments)
 
@@ -190,11 +210,11 @@ The operator signals with line-anchored `/`-commands in issue comments. Obey whe
 - Free-text bodies continue on following non-blank, non-command lines until a blank line or the next command.
 
 ### Deterministic lifecycle commands
-- `/approve` — spec/checklist accepted (`spec/2-approved` or equivalent state advance).
-- `/verify` or `/done` — work accepted pending check: run pre-flight, present for operator testing (`state/3-verify`).
+- `/approve` — spec/checklist accepted (`spec/approved` or equivalent state advance).
+- `/verify` or `/done` — work accepted pending check: run pre-flight, present for operator testing (`state/verify`).
 - `/close` — operator confirms the deliverable (`confirmed-done`).
-- `/hold` — stop and hand back to orchestrator (`attention/0-orchestrator`).
-- `/rework <note>` — return to `state/1-wip` with the note as the steering directive.
+- `/hold` — stop and hand back to orchestrator (`attention/orchestrator`).
+- `/rework <note>` — return to `state/wip` with the note as the steering directive.
 
 ### Free-text routing commands (orchestrator interprets, may route)
 - `/instruction <text>` — free-text directive to the orchestrator to prioritize, shape, or steer; it coordinates or dispatches to a worker (never permission for the orchestrator to write code).
@@ -210,8 +230,8 @@ routine webhook or dismiss it because it lacks a conventional command verb.
 ## 7. Attention Contract (Agreed Operating Rules)
 
 - The operator only touches `attention/*`. Nothing else is a signal.
-- `attention/0-orchestrator` means "you own it, don't let it sit": handle the deliverable, delegate, or — if the next step is unclear — flip to `attention/2-user` with a one-line question. An issue must never rest on `0-orchestrator`.
-- Anything needing operator eyes (approval, verify, decision, question) MUST carry `attention/2-user` — otherwise it is invisible.
+- `attention/orchestrator` means "you own it, don't let it sit": handle the deliverable, delegate, or — if the next step is unclear — flip to `attention/user` with a one-line question. An issue must never rest on `orchestrator`.
+- Anything needing operator eyes (approval, verify, decision, question) MUST carry `attention/user` — otherwise it is invisible.
 - Tree conflicts keep gating dispatch: no worker enters a checkout the operator is hands-on in. Queue, don't collide.
 - Pre-flight stands: never present unverified work for operator testing.
 - Verify is non-binding: resolve unilaterally with narration rather than park in mutual wait.
@@ -223,7 +243,7 @@ routine webhook or dismiss it because it lacks a conventional command verb.
 ## 9. Forgejo labels: comma-splitting and label normalization
 
 - **Comma-separated labels are supported** by `teax`:
-  `--add-label 'kind/bug,priority/2-normal'` adds both labels. Repeated flags
+  `--add-label 'kind/bug,priority/normal'` adds both labels. Repeated flags
   (`--add-label 'a' --add-label 'b'`) work too and remain the safest form.
 - **`teax` normalizes label flags before delegating**: it strips the label
   flags from the argument list, aggregates them across repeated and
@@ -261,6 +281,38 @@ routine webhook or dismiss it because it lacks a conventional command verb.
   - Agents on the local daemon are contacted directly via `paseo send --steer --no-wait <agentId> "<message>"` (plain text) or native MCP `send_agent_prompt`.
   - Do NOT use `x_comms_*` tools for local agents residing on the same machine/daemon. `x_comms_*` is strictly for cross-daemon/remote fleet hosts.
 
+### Fleet Signature for Agent/Router Prompts (platform#283)
+
+Every fleet-originated **agent/router prompt** — `paseo send` to a peer, a
+router prompt body (`POST /orchestrator`), or a hook delivery — begins with a
+hidden JSON signature in an HTML comment. Markdown renderers hide it, so the
+operator composer stays clean while models read the routing metadata first:
+
+```markdown
+<!-- {"fleet":{"v":1,"origin":"orchestrator","sender":"525721aa","repo":"forge.mrs.uppidi.com/xpufx-org/platform","kind":"escalation","ref":283}} -->
+Human-readable Markdown body goes here...
+```
+
+| Field | Value |
+| --- | --- |
+| `v` | Schema version. Currently `1`. |
+| `origin` | Who originated the message: `orchestrator`, `worker`, `router`, `watchdog`, or `frontdesk`. |
+| `sender` | The sending agent id (`$PASEO_AGENT_ID`). Process-originated messages use the process identity (`forgejo-hook`, `fleet-watchdog`). |
+| `repo` | The `host/owner/repo` the message concerns. The hook router and watchdog use the sentinels `frontdesk` and `fleet` for fleet-global messages with no repository. |
+| `kind` | `escalation` (orchestrator → Front Desk, operator input needed), `steer` (directive to a peer/router), `webhook` (router → agent event), `alert` (watchdog → Front Desk), or `handoff` (role/ownership transition). |
+| `ref` | The issue number, run id, or `null` when the message is not tied to one. |
+
+Rules:
+- Prepend the comment as the **first line**, then the human body. Do not duplicate
+  the body inside the JSON.
+- Set `sender` to `$PASEO_AGENT_ID` for agent-originated prompts.
+- The signature is **prompt-only**: it never replaces `teax --envelope` on
+  Forgejo issue/PR comments, and no hand-crafted wire/JSON envelope ever goes
+  into a comment body.
+- The hook router emits the signature on every webhook delivery, digest,
+  briefing/steer, stand-down, and watchdog alert while preserving the legacy
+  `[forgejo-hook] {json}` machine line.
+
 ## 11. Composer silence & webhook discipline (keep quiet)
 
 - **The composer window is unattended**: Nobody is sitting there reading the chat/composer feed. Do not treat the chat harness as a conversational surface or log stream.
@@ -274,9 +326,9 @@ routine webhook or dismiss it because it lacks a conventional command verb.
 
 - **Do not wait passively for webhooks**: Webhooks can fail, lag, or miss state changes. The Orchestrator proactively sweeps the board (`teax issue list`, `teax pr list`) periodically to maintain momentum.
 - **Sweep Precedence Checklist**:
-  1. **Review & Merge Open PRs (`state/2-review`, `review/0-needed`)**: Run pre-flight audits, merge passing PRs into `main`, and teardown worktrees immediately before picking up new work.
+  1. **Review & Merge Open PRs (`state/review`, `review/needed`)**: Run pre-flight audits, merge passing PRs into `main`, and teardown worktrees immediately before picking up new work.
   2. **Unblock Stalled Tickets (`dep/blocked`)**: Remove `dep/blocked` and queue when dependencies land.
-  3. **Triage & Dispatch (`attention/0-orchestrator`, `state/0-triage`)**: Shape checklist and dispatch worker into an isolated worktree. Never let an issue park on `0-orchestrator`.
+  3. **Triage & Dispatch (`attention/orchestrator`, `state/triage`)**: Shape checklist and dispatch worker into an isolated worktree. Never let an issue park on `orchestrator`.
 - Perform all sweep actions quietly on the Forgejo board without narrating the audit into the chat composer.
 
 ### Pre-Creation Dedup Search (MANDATORY before `teax issue create`)
@@ -302,7 +354,7 @@ Board ranking, triage, and dispatch are the Orchestrator's responsibility (worke
 2. **Agent Reasoning & Contextual Augmentation**:
    - **Do NOT blind-trust a "0 items" return from the script**: Deterministic checks evaluate labels and comment deltas, but cannot infer unstated context or emergent priorities.
    - When the script returns 0 items or when higher-level user directives take precedence, apply agent reasoning:
-     - Check discussions (`kind/discussion`) with operator guidance to shape into actionable specifications (`spec/0-needed` → `spec/1-checklist`).
+     - Check discussions (`kind/discussion`) with operator guidance to shape into actionable specifications (`spec/needed` → `spec/checklist`).
      - Check tickets unblocked by recent commits or sibling issues (`dep/blocked`).
      - Advance tickets blocked on clarifying questions.
    - A comment containing `/orchestrator <text>` is a direct routing signal
@@ -318,15 +370,18 @@ Board ranking, triage, and dispatch are the Orchestrator's responsibility (worke
 
 
 - **The Front Desk agent is the operator interface**: The human operator works directly through the Front Desk agent. Orchestrators do not talk into their own composer window. Front Desk never spawns workers — it steers orchestrators; orchestrators dispatch workers (two-tier spawn authority, [#172](https://forge.mrs.uppidi.com/xpufx-org/platform/issues/172)).
-- **Escalating when operator input is required (`attention/2-user`)**:
-  1. Determine the Front Desk agent ID and verify registration liveness via `scripts/frontdesk-info`:
+- **Escalating when operator input is required (`attention/user`)**:
+  1. Determine the Front Desk agent ID from the router and verify it is live:
      ```bash
-     scripts/frontdesk-info --json | jq -r '{live: .identity.liveFrontDeskId, discrepancy: .identity.discrepancy}'
+     FD=$(curl -s "http://<hook-host>:<port>/frontdesk" | jq -r '.agentId // empty')
+     paseo ls --json | jq --arg id "$FD" '.[] | select(.id == $id) | {id, name, status}'
+     # Loopback or secret holders can get the same cross-check in one call:
+     # curl -s "http://<hook-host>:<port>/frontdesk?detail=full" | jq '.frontDesk | {agentId, valid, status: .agent.status}'
      ```
-     Use `.identity.liveFrontDeskId` (not `registeredFrontDeskId`) for the escalation target, since `liveFrontDeskId` is the id that can actually receive a `paseo send`. When the registry is healthy, `liveFrontDeskId == registeredFrontDeskId`.
-     Check `.identity.discrepancy`: if non-null, surface it prominently rather than proceeding silently. A mismatch means the registration is broken and someone should know before, not after, a failed send.
+     Escalate only to a registered id that is also live (listed by `paseo ls --json`; `valid: true` under `?detail=full`).
+     If `agentId` is null, or the registered id is missing from `paseo ls`, the registration is broken: surface that prominently rather than proceeding silently — someone should know before, not after, a failed send. There is no automatic "live Front Desk" fallback; do not pick a substitute by agent name or label.
      Do not inspect `frontdesk.json`, `settings.json`, or `router-config.json` directly on disk.
-  2. If a live Front Desk exists (`liveFrontDeskId` is non-null), dispatch the escalation via the Hook Router (preferred) or `--steer`:
+  2. If a live registered Front Desk exists, dispatch the escalation via the Hook Router (preferred) or `--steer`:
      ```bash
      # Preferred: Async non-blocking delivery via Hook Router endpoint
      curl -s -X POST "http://<hook-host>:<port>/frontdesk/escalate" \
@@ -334,7 +389,8 @@ Board ranking, triage, and dispatch are the Orchestrator's responsibility (worke
        -d "{\"message\": \"Issue https://forge.mrs.uppidi.com/<repo>/issues/<n> needs operator attention: <concise question/action required>\"}"
      
      # Fallback: paseo send (MUST use --steer --no-wait to avoid synchronous model turn hang)
-     paseo send --steer --no-wait <liveFrontDeskId> "Issue https://forge.mrs.uppidi.com/<repo>/issues/<n> needs operator attention: <concise question/action required>"
+     paseo send --steer --no-wait "$FD" "<!-- {\"fleet\":{\"v\":1,\"origin\":\"orchestrator\",\"sender\":\"$PASEO_AGENT_ID\",\"repo\":\"<host/owner/repo>\",\"kind\":\"escalation\",\"ref\":<n>}} -->
+ Issue https://forge.mrs.uppidi.com/<repo>/issues/<n> needs operator attention: <concise question/action required>"
      ```
      > [!IMPORTANT]
      > CLI `paseo agent send` blocks synchronously awaiting model turn completion. Communicating across agents via Hook Router endpoints avoids model turn deadlocks and `ZOMBIE_HUNG_TURN` alerts.

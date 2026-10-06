@@ -20,6 +20,10 @@ This skill defines the operational workflow, tool usage, issue conventions, and 
 > **Plugin Storage Isolation**:
 > When implementing, modifying, or refactoring Paseo plugins, persistent data, configuration, queues, and state must **NEVER** be stored in arbitrary locations under `~/.paseo/` (e.g. `~/.paseo/logs`, `~/.paseo/queues`) or under `~/.config/<plugin>`. All plugin persistent state must be scoped strictly under `~/.paseo/plugin-data/<namespace>/<pluginId>/` via `PluginStorage`.
 
+> [!IMPORTANT]
+> **Workspace Scratch Isolation (`.tmp/`)**:
+> Never write temporary files, test scripts, downloaded keys, or scratch artifacts to global `/tmp` or paths outside your assigned workspace directory. Always use the workspace-scoped `<workspace>/.tmp/` directory (which is gitignored). Touching global `/tmp` violates workspace containment and triggers interactive permission stalls.
+
 ---
 
 ## 1. Primary Tool: `teax`
@@ -75,6 +79,11 @@ When referencing issues in comments, commit messages, or chat harness:
    Before reading or editing project files, require the Orchestrator's launch contract to identify the assigned `workspace_id`, absolute `workspace_path`, and workspace branch. Verify that the current directory matches that path and is an isolated linked Git worktree, not the primary checkout. Use read-only checks such as `git rev-parse` and `git worktree list`.
 
    If the contract is missing, the path or worktree does not match, or the workspace cannot be verified, stop immediately. Report that no valid Paseo workspace is assigned and ask the Orchestrator to provision or repair it. Do not edit files, create or switch workspaces, create or delete worktrees, or create, rename, switch, or delete branches as a workaround.
+
+   **Launch-Contract Validation**: The launch contract must reject a primary checkout.
+   If the resolved workspace path equals the project root or the git-directory probes
+   agree (`--git-dir == --git-common-dir`), refuse to proceed and ask the Orchestrator
+   to provision an isolated worktree workspace instead.
 
 2. **Paseo Owns Workspace Lifecycle**:
    Work only in the assigned Paseo workspace. Paseo/the Orchestrator owns workspace, worktree, and branch creation, naming, switching, archival, and deletion. The worker records the assigned workspace ID, branch ref, exact commit SHA, and remote in its handoff.
@@ -141,27 +150,27 @@ Labels are how the Orchestrator communicates the **state, bounds, and steering s
 
 - **Precedence Rule (Recent Updates Over Labels)**: On your assigned ticket, if there is a recent update (`updated_at` delta), **recent comments and feedback ALWAYS take precedence over static labels**. Never rely on a static label and move on without inspecting recent activity. **Read the 3 latest comments first** to understand the current state; if that context is inconclusive or references earlier requirements, read a few more comments backwards. If a human or peer agent posted new feedback or instructions after the last agent completion, that feedback governs your execution.
 - **`flag/stop-work`**: Circuit breaker scoped strictly to this issue. If your assigned ticket carries it, stop immediately — do not commit or push further changes for it, and escalate.
-- **`attention/2-user` (`user-attention`)**: Escalation signal for blocked or ambiguous assigned work. Used when the required deliverable (or next action) is fundamentally unclear.
+- **`attention/user` (`user-attention`)**: Escalation signal for blocked or ambiguous assigned work. Used when the required deliverable (or next action) is fundamentally unclear.
   - **Strict Guardrail**: Agents may **never** use this label as an excuse to avoid work or offload solvable technical decisions.
   - **Mandatory Requirement**: Whenever applying it, the agent **MUST** post a clear, precise comment directly addressing the human user (`@oktay`) stating what options exist and what exact clarification or decision is required to unblock execution.
 - **`upstream-check` / `check-upstream`**: Steering instruction on the assigned ticket. Before implementing custom logic or local workarounds, investigate upstream Paseo code, releases, PRs, issues, or discussions to see what Paseo already provides, plans to support, or how it implements the pattern natively.
 - **`upstream`**: The assigned work is blocked directly on an upstream Paseo capability or bug fix. Stop and escalate rather than working around it.
-- **`format/0-needed` / `format-issue`**: Clean up presentation, spelling, typos, broken markdown, code blocks, or formatting of the assigned ticket text without altering what it says or changing the author's meaning/intent.
+- **`format/needed` / `format-issue`**: Clean up presentation, spelling, typos, broken markdown, code blocks, or formatting of the assigned ticket text without altering what it says or changing the author's meaning/intent.
 - **`spec/*` (Pre-Code Steering Flow)**:
-  - **Phase 1: Shape & Plan (`spec/1-checklist`)**: When the assigned ticket is in the shaping stage, the job is **strictly pre-code shaping**. Ingest human steering, update the ticket body with clear specifications, boundary constraints, and concrete `- [ ]` checklists. **Zero code or file modifications are permitted during this phase.**
-  - **Phase 2: Human Approval (`spec/2-approved`)**: Implementation may **ONLY** begin after the human operator reviews the checklist and explicitly approves it (`spec/2-approved` / `green-light`).
+  - **Phase 1: Shape & Plan (`spec/checklist`)**: When the assigned ticket is in the shaping stage, the job is **strictly pre-code shaping**. Ingest human steering, update the ticket body with clear specifications, boundary constraints, and concrete `- [ ]` checklists. **Zero code or file modifications are permitted during this phase.**
+  - **Phase 2: Human Approval (`spec/approved`)**: Implementation may **ONLY** begin after the human operator reviews the checklist and explicitly approves it (`spec/approved` / `green-light`).
 - **`confirmed-done`**: Human operator confirms the final deliverable. Human says the last word with this; no other label except `SOS` has precedence. Agents may not reopen or modify an issue tagged `confirmed-done`.
-- **`priority/0-SOS`**: Highest priority urgent dispatch. If dispatched to it, drop other work and handle it immediately.
+- **`priority/sos`**: Highest priority urgent dispatch. If dispatched to it, drop other work and handle it immediately.
 - **`dep/blocked` / `blockee` / `blocker`**: Dependency indicators. Check linked blocking issues before proceeding with assigned work.
-- **`attention/3-ignore` (`agent-ignore`)**: Hard silence directive. The Orchestrator suppresses triage for this ticket unless escalated with `SOS`; a worker takes no action on it.
+- **`attention/ignore` (`agent-ignore`)**: Hard silence directive. The Orchestrator suppresses triage for this ticket unless escalated with `SOS`; a worker takes no action on it.
 
 ### Scoped & Exclusive Labels (Forgejo Native Standard)
 Defined in [`.forgejo/labels/agent-workflow.yaml`](file:///.forgejo/labels/agent-workflow.yaml). When scoped labels (`scope/name`) with `exclusive: true` are present, applying a new label in that scope automatically evicts any existing label sharing that scope prefix at the Forgejo DB level (zero `--remove-label` needed):
-- **`format/` Scope**: `format/0-needed` ↔ `format/1-ok` (cleaning presentation and applying `format/1-ok` automatically clears `format/0-needed`).
-- **`spec/` Scope**: `spec/0-needed` → `spec/1-checklist` → `spec/2-approved` (shaping phase transitions automatically clear previous stages).
-- **`state/` Scope**: `state/0-triage` → `state/1-wip` → `state/2-review` → `state/3-verify` → `state/4-done` (execution lifecycle).
-- **`attention/` Scope**: `attention/0-orchestrator` ↔ `attention/1-agent` ↔ `attention/2-user` ↔ `attention/3-ignore` (action token).
-- **`priority/` Scope**: `priority/0-SOS` ↔ `priority/1-high` ↔ `priority/2-normal` ↔ `priority/3-low` ↔ `priority/4-backburner`.
+- **`format/` Scope**: `format/needed` ↔ `format/ok` (cleaning presentation and applying `format/ok` automatically clears `format/needed`).
+- **`spec/` Scope**: `spec/needed` → `spec/checklist` → `spec/approved` (shaping phase transitions automatically clear previous stages).
+- **`state/` Scope**: `state/triage` → `state/wip` → `state/review` → `state/verify` → `state/done` (execution lifecycle).
+- **`attention/` Scope**: `attention/orchestrator` ↔ `attention/agent` ↔ `attention/user` ↔ `attention/ignore` (action token).
+- **`priority/` Scope**: `priority/sos` ↔ `priority/high` ↔ `priority/normal` ↔ `priority/low` ↔ `priority/backburner`.
 
 ---
 
@@ -175,7 +184,7 @@ Defined in [`.forgejo/labels/agent-workflow.yaml`](file:///.forgejo/labels/agent
 3. If the assigned ticket has **`upstream-check`**, first audit upstream Paseo repositories/docs to inform your approach.
 4. Check the assigned ticket's comments to verify no other agent has already claimed it; if it is already claimed, stop and escalate rather than duplicating work.
 5. Post an Agent Envelope comment announcing your claim **on the assigned ticket**.
-6. **Attach the `state/1-wip` label to the assigned ticket immediately** (e.g. `teax issue edit <number> --add-label state/1-wip`). Because `state/` is an exclusive scope, applying `state/1-wip` automatically clears any prior state like `state/0-triage` without needing removal flags.
+6. **Attach the `state/wip` label to the assigned ticket immediately** (e.g. `teax issue edit <number> --add-label state/wip`). Because `state/` is an exclusive scope, applying `state/wip` automatically clears any prior state like `state/triage` without needing removal flags.
 
 ### Step 2: Implementation Guidelines
 - **Autonomous Execution on Assigned Work:**
@@ -188,7 +197,7 @@ The worker runs **unattended** — nobody is watching its composer window, strea
 - **One surface for progress, and it is the board**: progress and findings belong on the issue/PR timeline as stamped envelope comments, budgeted per the Comment Budget rule above. Chat carries nothing but the brief token-economy pointer to the ticket.
 - **Silence covers the whole run, not just the ending**: no "starting now" opener, no mid-run check-ins, no celebrating a passing test suite, no asking permission for a routine step you were already authorized to take.
 - **Exceptions — speak only when they change someone else's next action**:
-  - a blocker that needs an Orchestrator decision (goes to the parent callback, Step 3.7, and `attention/2-user` on the ticket);
+  - a blocker that needs an Orchestrator decision (goes to the parent callback, Step 3.7, and `attention/user` on the ticket);
   - a completion signal to the parent (Step 3.7);
   - a direct interactive message from the human operator, answered in one line.
 - Emitting narration is a protocol violation even when the work is correct. A silent worker with a green PR is the success case.
@@ -211,7 +220,7 @@ When building or modifying client UI in Paseo plugins:
 
 - **Verification:** Run typechecks (`npm run typecheck`), linters, and test suites locally before claiming completion.
 
-### Step 3: Handoff to `Orchestrator` (`state/2-review` via Pull Request)
+### Step 3: Handoff to `Orchestrator` (`state/review` via Pull Request)
 When code is implemented and verified locally in your worktree:
 1. **Push the assigned workspace branch to `origin`**:
    ```bash
@@ -243,21 +252,21 @@ When code is implemented and verified locally in your worktree:
      - **Daemon Status**: Reloaded (`paseo plugin reload <id>`)
      - **Client Action**: Re-open the modal/surface (or press Ctrl+R / Cmd+R in Paseo if window is open).
      ```
-5. **Transition the state to `state/2-review`**: Apply **`state/2-review`** and `review/0-needed`.
-   - Command: `teax issue edit <number> --add-label state/2-review --add-label review/0-needed`
+5. **Transition the state to `state/review`**: Apply **`state/review`** and `review/needed`.
+   - Command: `teax issue edit <number> --add-label state/review --add-label review/needed`
    - **Automatic Eviction**: Because `state/` and `review/` are exclusive scopes, this clears prior states automatically.
-   - **Operator/Orchestrator verdict**: `review/2-approved` means advance to `state/3-verify` (or merge PR); `review/1-changes-requested` means return to `state/1-wip`.
+   - **Operator/Orchestrator verdict**: `review/approved` means advance to `state/verify` (or merge PR); `review/changes-requested` means return to `state/wip`.
 
    > [!CAUTION]
    > **MANDATORY LABEL UPDATE**: You MUST execute `teax issue edit <number> --add-label ...`. Merely posting an envelope comment without executing the label update command leaves the issue stranded in its old state on the board.
 
-6. **Do NOT close the issue, merge the PR, or archive the workspace**: Leaf workers do not merge PRs, close issues, or perform workspace/branch cleanup. The PR is merged by the Repo Orchestrator after pre-flight audit, transitioned to `state/3-verify` with `attention/2-user`, and archived. Autonomous actors never close issues — issue closure is strictly reserved for the human operator. Operator escalation is strictly via `attention/1-user`.
+6. **Do NOT close the issue, merge the PR, or archive the workspace**: Leaf workers do not merge PRs, close issues, or perform workspace/branch cleanup. The PR is merged by the Repo Orchestrator after pre-flight audit, transitioned to `state/verify` with `attention/user`, and archived. Autonomous actors never close issues — issue closure is strictly reserved for the human operator. Operator escalation is strictly via `attention/user`.
 7. **Notify the parent Orchestrator (MANDATORY)**: The board handoff above is the durable record; this callback is the immediate signal so the Orchestrator does not sit polling a ticket. On completion **or** on any blocker, message the parent explicitly:
    ```bash
    paseo send --steer --no-wait <parentAgentId> "Worker #<issue#> completed: PR <url>, tests pass."
    ```
    - `--steer` is **mandatory**: without it the default `activeTurnBehavior` is `interrupt`, which clobbers the parent's active turn mid-work (see `skills/orchestrator/SKILL.md` §13 for the same footgun on the Front Desk escalation path).
    - `<parentAgentId>` comes from the Orchestrator's launch contract; if it was not supplied, treat that as a contract gap and escalate on the ticket instead of staying silent.
-   - **This supplements the board handoff, it never replaces it**: still post the envelope comment, still apply `state/2-review` + `review/0-needed`. The callback is a ping, the board is the record.
+   - **This supplements the board handoff, it never replaces it**: still post the envelope comment, still apply `state/review` + `review/needed`. The callback is a ping, the board is the record.
    - Keep it to one line. Do not paste diffs, logs, or per-step narration into the parent message.
 8. Stand by for review from the `Orchestrator` or testing by the operator.

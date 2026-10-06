@@ -110,7 +110,7 @@ jobs:
             fi
             if [ -n "$new_issue_num" ]; then
               api_post "${API_URL}/repos/${REPO}/issues/${new_issue_num}/labels" \
-                '{"labels":["attention/0-orchestrator","kind/bug","priority/1-high"]}' >/dev/null
+                '{"labels":["attention/orchestrator","kind/bug","priority/high"]}' >/dev/null
             else
               echo "::warning::created failure issue but could not parse its number to attach labels"
             fi

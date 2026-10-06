@@ -112,12 +112,14 @@ jobs:
               .[] | select(.pull_request == null)
               | . as $i
               | (.labels | map(.name)) as $names
-              | select($names | index("state/1-wip"))
+              | select(($names | index("state/1-wip")) or ($names | index("state/wip")))
               | select((($names | index("flag/stop-work")) // null) == null)
               | select((($names | index("flag/wont-do")) // null) == null)
               | select((($names | index("attention/3-ignore")) // null) == null)
               | select((($names | index("attention/2-ignore")) // null) == null)
+              | select((($names | index("attention/ignore")) // null) == null)
               | select((($names | index("state/4-done")) // null) == null)
+              | select((($names | index("state/done")) // null) == null)
               | select(.updated_at < $cutoff)
               | "\(.number)\t\(.title)"')"
           elif command -v python3 >/dev/null 2>&1; then
@@ -135,7 +137,9 @@ jobs:
                   "flag/wont-do",
                   "attention/3-ignore",
                   "attention/2-ignore",
+                  "attention/ignore",
                   "state/4-done",
+                  "state/done",
               }
 
               for issue in issues:
@@ -146,7 +150,7 @@ jobs:
                   if issue.get("state") not in (None, "open"):
                       continue
                   labels = {l.get("name") for l in issue.get("labels", []) if isinstance(l, dict)}
-                  if "state/1-wip" not in labels:
+                  if not (labels & {"state/1-wip", "state/wip"}):
                       continue
                   if labels & skip_labels:
                       continue
@@ -186,12 +190,12 @@ jobs:
               continue
             fi
             # Two adds, no DELETE: `attention/*` exclusivity evicts any other
-            # attention label; `state/*` exclusivity evicts `state/1-wip`
+            # attention label; `state/*` exclusivity evicts `state/1-wip` or `state/wip`
             # itself. Writes are verified by re-reading below.
             api_post "${API_URL}/repos/${REPO}/issues/${num}/labels" '{"labels":["attention/0-orchestrator"]}' >/dev/null
             api_post "${API_URL}/repos/${REPO}/issues/${num}/labels" '{"labels":["state/0-triage"]}' >/dev/null
             labels_json="$(api_get "${API_URL}/repos/${REPO}/issues/${num}/labels")"
-            if has_label "$labels_json" "attention/0-orchestrator" && ! has_label "$labels_json" "state/1-wip"; then
+            if (has_label "$labels_json" "attention/0-orchestrator" || has_label "$labels_json" "attention/orchestrator") && ! has_label "$labels_json" "state/1-wip" && ! has_label "$labels_json" "state/wip"; then
               echo "recovered #${num}: ${title}"
               printf 'recovered\t%s\t%s\n' "$num" "$title" >> "$results"
             else
