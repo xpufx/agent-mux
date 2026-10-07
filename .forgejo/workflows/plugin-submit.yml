@@ -1,8 +1,10 @@
 # npm publish caller for the agent-mux plugin.
 #
-# Delegates the whole release to the platform reusable workflow: version bump,
-# `npm pack` staging, optional npm publish, and (when enabled) a GitHub mirror.
-# This repo publishes to npm only, so the mirror stays off.
+# Stage-only release path: the platform reusable workflow validates inputs,
+# syncs package.json to the git tag, runs `npm pack`, writes a manifest, and
+# uploads the tarball artifact. It never publishes to npm. The operator
+# downloads the artifact and runs `npm publish <tarball> --tag latest`.
+# No NPM_TOKEN is used or required.
 name: Plugin submit caller
 
 on:
@@ -12,15 +14,10 @@ on:
   workflow_dispatch:
     inputs:
       npm_tag:
-        description: 'npm dist-tag for the publish step'
+        description: 'npm dist-tag recorded in the staged manifest'
         required: false
         default: 'latest'
         type: string
-      publish:
-        description: 'Publish the staged tarball to npm'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   submit:
@@ -28,12 +25,8 @@ jobs:
     with:
       plugin_path: .
       npm_tag: ${{ inputs.npm_tag || 'latest' }}
-      publish: ${{ inputs.publish || github.ref_type == 'tag' }}
+      publish: false
       mirror: false
       mirror_repo: ""
-    # Valid at the caller job. Do not add workflow_call.secrets to the
-    # reusable workflow on runner v13.
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
