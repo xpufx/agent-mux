@@ -10,6 +10,9 @@ import {
 } from "./config.js";
 import { recordCooldown, logMuxMessage } from "./state.js";
 import { selectProfile, candidateKey, applyPoolModel } from "./router.js";
+import { parseResetDurationSeconds } from "./cooldown.js";
+
+export { parseResetDurationSeconds } from "./cooldown.js";
 
 /**
  * Extract readable text from a stream error payload. Engine frames may carry
@@ -94,21 +97,6 @@ export function isProcessCrashQuotaError(stderrLines: string[]): string | undefi
     }
   }
   return undefined;
-}
-
-export function parseResetDurationSeconds(text: string): number {
-  const m = text.match(/Resets in ([^\.]+)/);
-  if (m) {
-    const hours = m[1].match(/(\d+)\s*h/);
-    const mins = m[1].match(/(\d+)\s*m/);
-    const secs = m[1].match(/(\d+)\s*s/);
-    let total = 0;
-    if (hours) total += parseInt(hours[1], 10) * 3600;
-    if (mins) total += parseInt(mins[1], 10) * 60;
-    if (secs) total += parseInt(secs[1], 10);
-    if (total > 0) return total;
-  }
-  return 3600; // default 1h
 }
 
 export interface SupervisorOptions {

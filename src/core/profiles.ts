@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getRealHome, COMMON_DOTFILES } from "./paths.js";
-import { checkCooldown } from "./state.js";
+import { checkCooldown, clearCooldown, recordCooldown } from "./state.js";
+import { parseResetDurationSeconds } from "./cooldown.js";
 import type { ProviderAdapter, ProfileStatus } from "../types.js";
 
 export function listProfiles(adapter: ProviderAdapter): string[] {
@@ -70,6 +71,26 @@ export async function getProviderStatus(adapter: ProviderAdapter): Promise<Profi
       ? await adapter.getAccountIdentity(prof)
       : undefined;
     const pools = await adapter.getQuotaStatus(prof);
+
+    // A persisted lock can outlive an early provider-side quota reset. Recheck
+    // cooled pools when the adapter supports a live probe before rendering it.
+    if (adapter.probe) {
+      for (const p of pools) {
+        if (!checkCooldown(adapter.id, prof, p.pool).cooling) continue;
+        const probe = await adapter.probe(prof, p.pool);
+        if (probe.state === "READY") {
+          clearCooldown(adapter.id, prof, p.pool);
+        } else if (probe.state === "LIMIT") {
+          recordCooldown(
+            adapter.id,
+            prof,
+            p.pool,
+            parseResetDurationSeconds(probe.details),
+            probe.details
+          );
+        }
+      }
+    }
 
     // Overlay active persistent cooldowns if present
     for (const p of pools) {

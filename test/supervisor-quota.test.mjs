@@ -219,3 +219,33 @@ test("failure with structured object error persists a readable cooldown (#21)", 
     .pools.find((q) => q.pool === "claude");
   assert.equal(limited.state, "LIMIT");
 });
+
+test("status probe reconciles an early quota reset with the persisted cooldown (#25)", async () => {
+  let probes = 0;
+  const adapter = {
+    ...makeAdapter(),
+    probe: async () => {
+      probes++;
+      return { state: "READY", details: "Confirmed ready" };
+    }
+  };
+
+  assert.equal(parseResetDurationSeconds("Quota exceeded. Resets in 54m."), 54 * 60);
+  assert.equal(parseResetDurationSeconds("Quota exceeded. Resets in 1d2h3m4s."), 93784);
+  recordCooldown(
+    adapter.id,
+    "okprofile",
+    "gemini",
+    parseResetDurationSeconds("Quota exceeded. Resets in 54m."),
+    "Quota exceeded. Resets in 54m."
+  );
+
+  const status = await getProviderStatus(adapter);
+  const gemini = status
+    .find((p) => p.profile === "okprofile")
+    .pools.find((q) => q.pool === "gemini");
+
+  assert.equal(probes, 1);
+  assert.equal(gemini.state, "READY");
+  assert.equal(checkCooldown(adapter.id, "okprofile", "gemini").cooling, false);
+});
