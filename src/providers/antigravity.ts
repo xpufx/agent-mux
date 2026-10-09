@@ -5,6 +5,68 @@ import type { ProviderAdapter, PoolQuota, QuotaState } from "../types.js";
 import { getAgentProfilesDir, getRealHome } from "../core/paths.js";
 import { isQuotaError } from "../core/supervisor.js";
 
+/**
+ * Auth/credential paths (relative to real $HOME) that must stay profile-scoped
+ * in `scoped` isolation mode. Everything else under ~/.gemini (conversations,
+ * config, caches) remains the real user's and is shared across profiles.
+ */
+export const AGY_SCOPED_AUTH_PATHS = [
+  ".gemini/antigravity-cli/antigravity-oauth-token"
+];
+
+export const BWRAP_REQUIRED_MESSAGE =
+  "[agent-mux] Error: 'bwrap' (bubblewrap) is required for isolation_mode 'scoped', " +
+  "but was not found in PATH.\n" +
+  "Please install bubblewrap using your system package manager:\n" +
+  "  - Ubuntu / Debian: sudo apt install bubblewrap\n" +
+  "  - Arch Linux:      sudo pacman -S bubblewrap\n" +
+  "  - Fedora / RHEL:   sudo dnf install bubblewrap\n" +
+  "Or configure agent-mux to use fallback mode:\n" +
+  "  agent-mux config set isolation_mode home";
+
+export function findExecutableInPath(
+  name: string,
+  pathEnv: string = process.env.PATH ?? ""
+): string | undefined {
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      }
+    } catch {}
+  }
+  return undefined;
+}
+
+/**
+ * Build the bwrap argument list for scoped Antigravity execution. Only the
+ * auth/credential files in {@link AGY_SCOPED_AUTH_PATHS} are bind-mounted from
+ * the profile; the real `~/.gemini` tree stays visible for everything else.
+ * Missing profile credentials are masked with an empty placeholder so a
+ * not-yet-logged-in profile can never read another profile's token.
+ */
+export function buildScopedBwrapArgs(
+  profileDir: string,
+  realHome: string,
+  binary: string,
+  args: string[]
+): string[] {
+  const bwrapArgs = ["--dev-bind", "/", "/"];
+  for (const relPath of AGY_SCOPED_AUTH_PATHS) {
+    const src = path.join(profileDir, relPath);
+    const dest = path.join(realHome, relPath);
+    fs.mkdirSync(path.dirname(src), { recursive: true });
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    if (!fs.existsSync(src)) fs.writeFileSync(src, "");
+    bwrapArgs.push("--bind", src, dest);
+  }
+  bwrapArgs.push(binary, ...args);
+  return bwrapArgs;
+}
+
 function parseDurationSeconds(dStr: string): number {
   const hours = dStr.match(/(\d+)\s*h/);
   const mins = dStr.match(/(\d+)\s*m/);
@@ -91,22 +153,24 @@ export class AntigravityAdapter implements ProviderAdapter {
     const realHome = getRealHome();
 
     if (isolationMode === "scoped") {
-      // In scoped mode: HOME and cwd remain the real user home.
-      // Use bwrap to overlay the profile's .gemini onto real ~/.gemini privately.
-      const profGeminiDir = path.join(profDir, ".gemini");
-      const realGeminiDir = path.join(realHome, ".gemini");
-      fs.mkdirSync(profGeminiDir, { recursive: true });
-      fs.mkdirSync(realGeminiDir, { recursive: true });
+      // In scoped mode: HOME and cwd remain the real user home. Only the
+      // profile's auth/credential files are bind-mounted over the real ones via
+      // bwrap, so concurrent profiles cannot read each other's login state
+      // while ~/.gemini conversations/config stay shared.
+      const bwrapBin = findExecutableInPath("bwrap", baseEnv.PATH ?? process.env.PATH);
+      if (!bwrapBin) {
+        throw new Error(BWRAP_REQUIRED_MESSAGE);
+      }
 
-      const bwrapArgs = [
-        "--dev-bind", "/", "/",
-        "--bind", profGeminiDir, realGeminiDir,
+      const bwrapArgs = buildScopedBwrapArgs(
+        profDir,
+        realHome,
         this.defaultBinaryPath,
-        ...args
-      ];
+        args
+      );
 
       return {
-        binary: "bwrap",
+        binary: bwrapBin,
         args: bwrapArgs,
         env: {
           ...baseEnv,
@@ -134,7 +198,11 @@ export class AntigravityAdapter implements ProviderAdapter {
       profile,
       ".gemini/antigravity-cli/antigravity-oauth-token"
     );
-    return fs.existsSync(tokenPath);
+    try {
+      return fs.statSync(tokenPath).size > 0;
+    } catch {
+      return false;
+    }
   }
 
   async getAccountIdentity(profile: string): Promise<string | undefined> {

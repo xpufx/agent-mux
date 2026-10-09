@@ -125,6 +125,6 @@ export function getIsolationMode(): IsolationMode {
     if (parsed) return parsed;
   }
 
-  // 3. Default to "home" (profile directory acts as independent HOME, complete isolation)
-  return "home";
+  // 3. Default to "scoped" (real $HOME with per-profile auth; bwrap/XDG isolation)
+  return "scoped";
 }

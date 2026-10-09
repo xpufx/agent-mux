@@ -17,7 +17,7 @@ The included wrapper scripts (if you run install.sh) mean you do not need to cha
 Agent CLIs such as Google Antigravity (`agy`) and OpenCode enforce rolling token limits or rate limits per account. When driven by autonomous agent frameworks like Paseo, hitting a rate limit or HTTP 429 mid-turn terminates or stalls the agent session.
 
 `agent-mux` provides:
-1. **Environment Isolation**: Each account has an isolated `$HOME` directory under `~/.agent-mux/profiles/<provider>/<account>` so local configurations, credentials, and state caches never conflict.
+1. **Environment Isolation**: By default (`isolation_mode: scoped`) each account keeps the real `$HOME` (`/home/<user>`) and only its auth/credential state is scoped per profile, so local configurations, caches, and state caches never conflict while agents still see the real host home. `isolation_mode: home` remains available as explicit opt-in for a fully isolated `$HOME` under `~/.agent-mux/profiles/<provider>/<account>`.
 2. **Configurable Base**: Defaults to `~/.agent-mux`, configurable via the `AGENT_MUX_HOME` environment variable.
 3. **Arbitrary $N$ Accounts**: Scale beyond 2 accounts to 3, 5, or more per provider with automatic sequential fallback and round-robin scheduling.
 4. **Shared Session History**: Trajectory databases (e.g. SQLite conversation stores) and developer dotfiles (`.gitconfig`, `.ssh`, `.agents`) are symlinked across profiles so project context is preserved.
@@ -50,7 +50,8 @@ Clients (Paseo, Terminal, Automation)
         │     │     1. Records cooldown with reset timestamp to disk
         │     │     2. Queries router for healthy fallback candidate
         │     │     3. If all candidates exhausted: HALTS immediately (no flapping)
-        │     │     4. If healthy candidate exists: switches HOME & replays turn
+        │     │     4. If healthy candidate exists: switches profile & replays turn
+        │     │        (swaps the scoped auth bind; swaps HOME only in `home` mode)
         │     ▼
         ▼
    Shared Trajectory Store (~/.gemini/.../conversations/*.db, ~/.local/share/opencode)
@@ -142,7 +143,7 @@ agent-mux status
 
 Output:
 ```text
-=== agent-mux Provider & Profile Status [Isolation Mode: home] ===
+=== agent-mux Provider & Profile Status [Isolation Mode: scoped] ===
 
 Provider: Google Antigravity (antigravity)
   • primary [Authenticated] (primary@example.com):
@@ -234,7 +235,7 @@ agent-mux profile list
 
 Output:
 ```text
-=== Configured Account Profiles [Isolation Mode: home] ===
+=== Configured Account Profiles [Isolation Mode: scoped] ===
 
 Provider: Google Antigravity (antigravity)
 Base directory: ~/.agent-mux/profiles/antigravity
@@ -296,17 +297,18 @@ agent-mux config set surface_account none
 
 Controls how account isolation and the agent process environment are handled:
 
-- **`home`** (default): Each profile acts as an independent `$HOME` (`~/.agent-mux/profiles/<provider>/<profile>`). Fully isolated dotfiles, caches, and history per profile.
-- **`scoped`**: The agent process keeps the real user `$HOME` and `cwd` (`/home/<user>`). Only provider-specific configs and credentials are scoped per profile:
-  - Antigravity uses a private Linux mount overlay via `bwrap` mapping `~/.gemini` to the profile.
+- **`scoped`** (default): The agent process keeps the real user `$HOME` and `cwd` (`/home/<user>`). Only provider-specific auth/credential state is scoped per profile, so concurrent accounts never share a login while everything else (dotfiles, `~/.gemini` conversations/config, project caches) stays on the real host home:
+  - Antigravity uses a private Linux mount overlay via `bwrap` that bind-mounts **only** `~/.gemini/antigravity-cli/antigravity-oauth-token` from the profile. Real `~/.gemini` (conversations, `config`, caches) remains visible and is shared across profiles.
   - OpenCode uses `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
   - Both instances can run concurrently with real `$HOME` and real working directory.
+  - `bwrap` (bubblewrap) is required for Antigravity in this mode. If it is missing, `agent-mux` fails fast with install instructions for your distro; `install.sh` also warns during setup.
+- **`home`** (opt-in): Each profile acts as an independent `$HOME` (`~/.agent-mux/profiles/<provider>/<profile>`). Fully isolated dotfiles, caches, and history per profile. Use this only when agents must not see the real host home.
 
 ```bash
-# Switch to scoped mode (real HOME with scoped configs)
+# Default: real HOME with per-profile auth (requires bwrap for agy)
 agent-mux config set isolation_mode scoped
 
-# Switch back to isolated home mode (independent HOME per profile)
+# Opt in to a fully isolated profile HOME
 agent-mux config set isolation_mode home
 ```
 
@@ -344,7 +346,7 @@ AGENT_MUX_ROUTING_POLICY=pool-spillover agy -p "echo hi"
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `AGENT_MUX_HOME` | Custom base directory for profiles and state | `~/.agent-mux` |
-| `AGENT_MUX_ISOLATION_MODE` | Overrides `isolation_mode` (`home` or `scoped`) | Config file / `home` |
+| `AGENT_MUX_ISOLATION_MODE` | Overrides `isolation_mode` (`scoped` or `home`) | Config file / `scoped` |
 | `AGENT_MUX_SURFACE_ACCOUNT` | Overrides `surface_account` mode (`none`, `tool`, `message`, `both`) | Config file / `none` |
 | `AGENT_MUX_ROUTING_POLICY` | Overrides `routingPolicy` (`pool-strict`, `pool-spillover`, `account-first`) | Config file / `pool-strict` |
 | `AGENT_MUX_PROFILE` | Forces execution to a specific account profile | Auto-routed |

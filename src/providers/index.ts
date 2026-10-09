@@ -2,6 +2,8 @@ import type { ProviderAdapter } from "../types.js";
 import { AntigravityAdapter } from "./antigravity.js";
 import { OpenCodeAdapter } from "./opencode.js";
 
+export * from "./antigravity.js";
+
 const adapters: Record<string, ProviderAdapter> = {
   antigravity: new AntigravityAdapter(),
   agy: new AntigravityAdapter(),

@@ -41,6 +41,15 @@ echo "Target Provider    : $TARGET_PROVIDER"
 echo "Configured Accounts: ${ACCOUNTS[*]}"
 echo ""
 
+# Pre-flight: scoped isolation (the default) relies on bubblewrap for agy.
+if ! command -v bwrap >/dev/null 2>&1; then
+  echo "[!] WARNING: 'bwrap' (bubblewrap) was not found in PATH."
+  echo "    The default isolation_mode 'scoped' requires it for agy."
+  echo "    Install:  sudo apt install bubblewrap  |  sudo pacman -S bubblewrap  |  sudo dnf install bubblewrap"
+  echo "    Fallback: agent-mux config set isolation_mode home"
+  echo ""
+fi
+
 # 1. Build TypeScript binaries
 echo "[+] Building TypeScript binaries..."
 (cd "$DIR" && npm run build)
