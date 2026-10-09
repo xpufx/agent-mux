@@ -70,9 +70,14 @@ export function buildScopedBwrapArgs(
   profileDir: string,
   realHome: string,
   binary: string,
-  args: string[]
+  args: string[],
+  options: { muxProfilesDir?: string } = {}
 ): string[] {
-  const bwrapArgs = ["--dev-bind", "/", "/"];
+  const bwrapArgs = [
+    "--dev-bind", "/", "/",
+    "--tmpfs", "/run/user",
+    "--unsetenv", "DBUS_SESSION_BUS_ADDRESS"
+  ];
   for (const relPath of AGY_SCOPED_AUTH_PATHS) {
     const src = path.join(profileDir, relPath);
     const dest = path.join(realHome, relPath);
@@ -80,6 +85,10 @@ export function buildScopedBwrapArgs(
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     if (!fs.existsSync(src)) fs.writeFileSync(src, "");
     bwrapArgs.push("--bind", src, dest);
+  }
+  const profilesDir = options.muxProfilesDir ?? path.join(realHome, ".agent-mux", "profiles");
+  if (fs.existsSync(profilesDir)) {
+    bwrapArgs.push("--tmpfs", profilesDir);
   }
   bwrapArgs.push(binary, ...args);
   return bwrapArgs;
@@ -180,33 +189,40 @@ export class AntigravityAdapter implements ProviderAdapter {
         throw new Error(BWRAP_REQUIRED_MESSAGE);
       }
 
+      const cleanedEnv: NodeJS.ProcessEnv = {
+        ...baseEnv,
+        HOME: realHome,
+        REAL_HOME: realHome
+      };
+      delete cleanedEnv.DBUS_SESSION_BUS_ADDRESS;
+
       const bwrapArgs = buildScopedBwrapArgs(
         profDir,
         realHome,
         this.defaultBinaryPath,
-        args
+        args,
+        { muxProfilesDir: path.dirname(this.profilesBaseDir) }
       );
 
       return {
         binary: bwrapBin,
         args: bwrapArgs,
-        env: {
-          ...baseEnv,
-          HOME: realHome,
-          REAL_HOME: realHome
-        }
+        env: cleanedEnv
       };
     }
 
     // Default "home" mode: profile acts as independent HOME directory
+    const cleanedEnv: NodeJS.ProcessEnv = {
+      ...baseEnv,
+      HOME: profDir,
+      REAL_HOME: realHome
+    };
+    delete cleanedEnv.DBUS_SESSION_BUS_ADDRESS;
+
     return {
       binary: this.defaultBinaryPath,
       args,
-      env: {
-        ...baseEnv,
-        HOME: profDir,
-        REAL_HOME: realHome
-      }
+      env: cleanedEnv
     };
   }
 

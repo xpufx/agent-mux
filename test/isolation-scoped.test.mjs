@@ -47,12 +47,14 @@ function makeProfile(name, token) {
   return profDir;
 }
 
-test("scoped bwrap args bind only agy auth paths and preserve real .gemini", () => {
+test("scoped bwrap args bind only agy auth paths, mask D-Bus, and preserve real .gemini", () => {
   const profDir = makeProfile("alpha", "ALPHA-TOKEN\n");
   const args = buildScopedBwrapArgs(profDir, realHome, "/home/x/.local/bin/agy.bin", ["-p", "hi"]);
 
   assert.deepEqual(args, [
     "--dev-bind", "/", "/",
+    "--tmpfs", "/run/user",
+    "--unsetenv", "DBUS_SESSION_BUS_ADDRESS",
     "--bind", path.join(profDir, realTokenRel), realToken,
     "/home/x/.local/bin/agy.bin", "-p", "hi"
   ]);
@@ -67,14 +69,26 @@ test("scoped bwrap args bind only agy auth paths and preserve real .gemini", () 
   assert.deepEqual(AGY_SCOPED_AUTH_PATHS, [realTokenRel]);
 });
 
-test("scoped prepareExecution keeps real HOME, resolves bwrap, and masks missing profiles", () => {
+test("scoped prepareExecution keeps real HOME, strips DBUS_SESSION_BUS_ADDRESS, resolves bwrap, and masks profiles", () => {
   const profDir = makeProfile("beta");
-  const target = adapter.prepareExecution("beta", ["--model", "gemini"], { PATH: fakeBin }, "scoped");
+  const target = adapter.prepareExecution(
+    "beta",
+    ["--model", "gemini"],
+    { PATH: fakeBin, DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1001/bus" },
+    "scoped"
+  );
 
   assert.equal(target.binary, path.join(fakeBin, "bwrap"));
   assert.equal(target.env.HOME, realHome);
   assert.equal(target.env.REAL_HOME, realHome);
-  assert.deepEqual(target.args.slice(0, 3), ["--dev-bind", "/", "/"]);
+  assert.equal(target.env.DBUS_SESSION_BUS_ADDRESS, undefined);
+  assert.deepEqual(target.args.slice(0, 7), [
+    "--dev-bind", "/", "/",
+    "--tmpfs", "/run/user",
+    "--unsetenv", "DBUS_SESSION_BUS_ADDRESS"
+  ]);
+  assert.ok(target.args.includes("--tmpfs"));
+  assert.ok(target.args.includes(path.join(muxHome, "profiles")));
   assert.deepEqual(target.args.slice(-2), ["--model", "gemini"]);
 
   // A never-logged-in profile gets an empty placeholder so the real token is masked.
@@ -172,4 +186,41 @@ test("concurrent profiles see their own token under bwrap and never cross-contam
 
   // Restore for any later assertions in this process.
   fs.writeFileSync(path.join(alpha, realTokenRel), "ALPHA-TOKEN\n");
+});
+
+test("scoped bwrap isolates D-Bus and peer profile directories inside sandbox", (t) => {
+  const systemBwrap = findExecutableInPath("bwrap");
+  if (!systemBwrap) {
+    t.skip("bwrap not installed on host");
+    return;
+  }
+
+  const alpha = makeProfile("alpha", "ALPHA-TOKEN\n");
+  const beta = makeProfile("beta", "BETA-TOKEN\n");
+  const profilesDir = path.join(muxHome, "profiles");
+
+  const run = (script) => {
+    const args = buildScopedBwrapArgs(alpha, realHome, "/bin/sh", ["-c", script], {
+      muxProfilesDir: profilesDir
+    });
+    return spawnSync(systemBwrap, args, {
+      encoding: "utf-8",
+      env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1001/bus" }
+    });
+  };
+
+  // 1. D-Bus session bus address is unset and /run/user is an empty tmpfs
+  const dbusRes = run('echo "DBUS=$DBUS_SESSION_BUS_ADDRESS"; ls /run/user');
+  assert.equal(dbusRes.status, 0);
+  assert.ok(dbusRes.stdout.includes("DBUS=\n"));
+
+  // 2. Profiles directory is masked with empty tmpfs; peer profiles cannot be listed
+  const profRes = run(`ls ${profilesDir}`);
+  assert.equal(profRes.status, 0);
+  assert.equal(profRes.stdout.trim(), "");
+
+  // 3. Alpha's token is still intact and reachable at realToken
+  const tokenRes = run(`cat ${realToken}`);
+  assert.equal(tokenRes.status, 0);
+  assert.equal(tokenRes.stdout, "ALPHA-TOKEN\n");
 });
