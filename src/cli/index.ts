@@ -1,4 +1,4 @@
-import { getProviderAdapter, listSupportedProviders } from "../providers/index.js";
+import { getProviderAdapter, listSupportedProviders, AGY_NON_PROMPT_SUBCOMMANDS } from "../providers/index.js";
 import { getProviderStatus, listProfiles } from "../core/profiles.js";
 import { selectProfile, applyPoolModel } from "../core/router.js";
 import { runSupervisor, parseResetDurationSeconds } from "../core/supervisor.js";
@@ -94,8 +94,14 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
     }
   }
 
+  const subCmd = cmdArgs.find((a) => !a.startsWith("-"));
+  const isAgySubcommand =
+    adapter.id === "antigravity" &&
+    subCmd !== undefined &&
+    AGY_NON_PROMPT_SUBCOMMANDS.has(subCmd);
+
   const decision = await selectProfile(adapter, cmdArgs, process.env, mode);
-  const execArgs = applyPoolModel(adapter, cmdArgs, decision.pool);
+  const execArgs = isAgySubcommand ? [...cmdArgs] : applyPoolModel(adapter, cmdArgs, decision.pool);
 
   if (isStreamJson) {
     const code = await runSupervisor({

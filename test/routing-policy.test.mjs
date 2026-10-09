@@ -231,3 +231,12 @@ test("getRoutingPolicy - env override, then config file, then pool-strict defaul
   fs.rmSync(configPath, { force: true });
   assert.equal(getRoutingPolicy(), "pool-strict");
 });
+
+test("AGY_NON_PROMPT_SUBCOMMANDS contains non-prompt subcommands like models, help, mcp", async () => {
+  const { AGY_NON_PROMPT_SUBCOMMANDS } = await import("../dist/index.js");
+  assert.ok(AGY_NON_PROMPT_SUBCOMMANDS.has("models"));
+  assert.ok(AGY_NON_PROMPT_SUBCOMMANDS.has("help"));
+  assert.ok(AGY_NON_PROMPT_SUBCOMMANDS.has("version") === false); // agy has --version flag, not subcommand
+  assert.ok(AGY_NON_PROMPT_SUBCOMMANDS.has("mcp"));
+  assert.ok(AGY_NON_PROMPT_SUBCOMMANDS.has("agent"));
+});
