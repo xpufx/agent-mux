@@ -19,7 +19,7 @@ import {
 import { getAgentLogFilePath } from "../core/paths.js";
 import fs from "node:fs";
 
-async function printStatus(providerId?: string) {
+async function printStatus(providerId?: string, options: { probe?: boolean } = {}) {
   const providers = providerId
     ? [getProviderAdapter(providerId)]
     : listSupportedProviders();
@@ -29,7 +29,7 @@ async function printStatus(providerId?: string) {
 
   for (const prov of providers) {
     console.log(`\nProvider: ${prov.displayName} (${prov.id})`);
-    const profiles = await getProviderStatus(prov);
+    const profiles = await getProviderStatus(prov, options);
 
     if (profiles.length === 0) {
       console.log(`  (No profiles configured at ${prov.profilesBaseDir})`);
@@ -152,7 +152,7 @@ function printHelp() {
   console.log(`agent-mux - Multi-Account Multiplexer and Stream Supervisor
 
 Usage:
-  agent-mux status [provider]                 View live quota and auth status
+  agent-mux status [provider] [--probe]       View quota and auth status (instant; --probe to check early reset)
   agent-mux probe <provider> [profile] [pool] Actively test live model/server access
   agent-mux models <provider> [--free]        List models available in CLI (optionally free only)
   agent-mux profile list [provider]           List all configured account profiles
@@ -525,7 +525,9 @@ async function main() {
   }
 
   if (cmd === "status") {
-    await printStatus(args[1]);
+    const probe = args.includes("--probe");
+    const provId = args.slice(1).find((a) => !a.startsWith("-"));
+    await printStatus(provId, { probe });
     return;
   }
 

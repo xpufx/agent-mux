@@ -220,7 +220,7 @@ test("failure with structured object error persists a readable cooldown (#21)", 
   assert.equal(limited.state, "LIMIT");
 });
 
-test("status probe reconciles an early quota reset with the persisted cooldown (#25)", async () => {
+test("status is instant by default and probe is opt-in via options.probe (#25)", async () => {
   let probes = 0;
   const adapter = {
     ...makeAdapter(),
@@ -240,12 +240,23 @@ test("status probe reconciles an early quota reset with the persisted cooldown (
     "Quota exceeded. Resets in 54m."
   );
 
-  const status = await getProviderStatus(adapter);
-  const gemini = status
+  // 1. By default, status is instant (<10ms) and does NOT perform network probes
+  const defaultStatus = await getProviderStatus(adapter);
+  const geminiDefault = defaultStatus
     .find((p) => p.profile === "okprofile")
     .pools.find((q) => q.pool === "gemini");
 
-  assert.equal(probes, 1);
-  assert.equal(gemini.state, "READY");
+  assert.equal(probes, 0, "Default status must not probe network");
+  assert.equal(geminiDefault.state, "LIMIT");
+  assert.equal(checkCooldown(adapter.id, "okprofile", "gemini").cooling, true);
+
+  // 2. Opt-in probe reconciles early reset
+  const probedStatus = await getProviderStatus(adapter, { probe: true });
+  const geminiProbed = probedStatus
+    .find((p) => p.profile === "okprofile")
+    .pools.find((q) => q.pool === "gemini");
+
+  assert.equal(probes, 1, "Opt-in probe runs network probe");
+  assert.equal(geminiProbed.state, "READY");
   assert.equal(checkCooldown(adapter.id, "okprofile", "gemini").cooling, false);
 });

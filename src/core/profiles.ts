@@ -61,7 +61,10 @@ export function removeProfile(adapter: ProviderAdapter, profile: string): boolea
   return true;
 }
 
-export async function getProviderStatus(adapter: ProviderAdapter): Promise<ProfileStatus[]> {
+export async function getProviderStatus(
+  adapter: ProviderAdapter,
+  options: { probe?: boolean } = {}
+): Promise<ProfileStatus[]> {
   const profiles = listProfiles(adapter);
   const results: ProfileStatus[] = [];
 
@@ -72,9 +75,9 @@ export async function getProviderStatus(adapter: ProviderAdapter): Promise<Profi
       : undefined;
     const pools = await adapter.getQuotaStatus(prof);
 
-    // A persisted lock can outlive an early provider-side quota reset. Recheck
-    // cooled pools when the adapter supports a live probe before rendering it.
-    if (adapter.probe) {
+    // Live probe is opt-in (e.g. status --probe). By default status is instant (<10ms)
+    // and relies on persisted cooldown timestamps which auto-clear upon expiry.
+    if (options.probe && adapter.probe) {
       for (const p of pools) {
         if (!checkCooldown(adapter.id, prof, p.pool).cooling) continue;
         const probe = await adapter.probe(prof, p.pool);
