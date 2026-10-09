@@ -299,8 +299,9 @@ Controls how account isolation and the agent process environment are handled:
 
 - **`scoped`** (default): The agent process keeps the real user `$HOME` and `cwd` (`/home/<user>`). Only provider-specific auth/credential state is scoped per profile, so concurrent accounts never share a login while everything else (dotfiles, `~/.gemini` conversations/config, project caches) stays on the real host home:
   - Antigravity uses a private Linux mount overlay via `bwrap` that bind-mounts **only** `~/.gemini/antigravity-cli/antigravity-oauth-token` from the profile. Real `~/.gemini` (conversations, `config`, caches) remains visible and is shared across profiles.
-  - Bubblewrap hardens the sandbox against ambient credential channels by mounting an empty `tmpfs` over `/run/user` and unsetting `DBUS_SESSION_BUS_ADDRESS`. This prevents `agy.bin`'s chained auth from falling back to the host desktop keyring (`org.freedesktop.secrets`).
-  - Bubblewrap masks peer profile directories by mounting an empty `tmpfs` over `~/.agent-mux/profiles`, ensuring running agents cannot inspect tokens or state from other profiles.
+  - Bubblewrap hardens the environment against ambient credential channels by mounting an empty `tmpfs` over `/run/user` and unsetting `DBUS_SESSION_BUS_ADDRESS`. This prevents `agy.bin`'s chained auth from falling back to the host desktop keyring (`org.freedesktop.secrets`).
+  - Bubblewrap masks peer profile directories by mounting an empty `tmpfs` over `~/.agent-mux/profiles`, preventing unintentional token inspection across profiles.
+  - **Important**: The use of Bubblewrap here is strictly an **environment multiplexing and credential routing mechanism**, NOT a security boundary or containment sandbox. Processes inside `scoped` mode run with `--dev-bind / /` under your host user identity, retaining full read/write access to your system, tools, and repositories so coding agents can do their work. Do not treat `agent-mux` as a sandbox against untrusted code.
   - OpenCode uses `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
   - Both instances can run concurrently with real `$HOME` and real working directory.
   - `bwrap` (bubblewrap) is required for Antigravity in this mode. If it is missing, `agent-mux` fails fast with install instructions for your distro; `install.sh` also warns during setup.
