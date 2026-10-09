@@ -28,6 +28,11 @@ function makeSandbox() {
   fs.mkdirSync(path.join(realHome, ".ssh"), { recursive: true });
   fs.mkdirSync(path.join(realHome, ".gemini", "antigravity-cli"), { recursive: true });
   fs.writeFileSync(path.join(realHome, ".gemini", "antigravity-cli", "settings.json"), "{}\n");
+  fs.writeFileSync(
+    path.join(realHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+    '{"id_token":"mock"}\n'
+  );
+  fs.mkdirSync(path.join(realHome, ".gemini", "config"), { recursive: true });
   fs.mkdirSync(path.join(realHome, ".config", "opencode"), { recursive: true });
   fs.mkdirSync(path.join(realHome, ".local", "share", "opencode"), { recursive: true });
   fs.writeFileSync(path.join(realHome, ".local", "share", "opencode", "auth.json"), "{}\n");
@@ -68,7 +73,21 @@ test("planSetup plans profile trees, dotfile links and wrappers without writing"
   );
   assert.ok(
     plan.some(
+      (a) =>
+        a.kind === "mkdir" &&
+        a.target === path.join(agyPrimary, ".gemini", "antigravity-cli")
+    )
+  );
+  assert.ok(
+    !plan.some(
       (a) => a.kind === "symlink" && a.target === path.join(agyPrimary, ".gemini")
+    )
+  );
+  assert.ok(
+    plan.some(
+      (a) =>
+        a.kind === "copy" &&
+        a.target === path.join(agyPrimary, ".gemini", "antigravity-cli", "antigravity-oauth-token")
     )
   );
   assert.ok(plan.some((a) => a.kind === "copy" && a.target === path.join(sb.localBin, "agy")));
@@ -115,8 +134,36 @@ test("runSetup applies the plan and is idempotent", () => {
     "share",
     "opencode"
   );
+  const agySecondary = path.join(sb.agentMuxHome, "profiles", "antigravity", "secondary");
   assert.ok(fs.lstatSync(path.join(agyPrimary, ".gitconfig")).isSymbolicLink());
-  assert.ok(fs.lstatSync(path.join(agyPrimary, ".gemini")).isSymbolicLink());
+  assert.ok(fs.lstatSync(path.join(agyPrimary, ".gemini")).isDirectory());
+  assert.ok(!fs.lstatSync(path.join(agyPrimary, ".gemini")).isSymbolicLink());
+  assert.ok(fs.lstatSync(path.join(agyPrimary, ".gemini", "config")).isSymbolicLink());
+  assert.ok(
+    fs
+      .lstatSync(path.join(agyPrimary, ".gemini", "antigravity-cli", "conversations"))
+      .isSymbolicLink()
+  );
+
+  // Primary profile gets seeded token as a real file, not symlink
+  const primaryToken = path.join(
+    agyPrimary,
+    ".gemini",
+    "antigravity-cli",
+    "antigravity-oauth-token"
+  );
+  assert.ok(fs.lstatSync(primaryToken).isFile());
+  assert.ok(!fs.lstatSync(primaryToken).isSymbolicLink());
+
+  // Secondary profile does not inherit the primary token
+  const secondaryToken = path.join(
+    agySecondary,
+    ".gemini",
+    "antigravity-cli",
+    "antigravity-oauth-token"
+  );
+  assert.equal(fs.existsSync(secondaryToken), false);
+
   // Managed opencode dirs must stay real directories, not dotfile symlinks.
   assert.ok(!fs.lstatSync(path.dirname(path.dirname(opencodePrimaryData))).isSymbolicLink());
   assert.ok(fs.statSync(path.join(opencodePrimaryData, "auth.json")).isFile());
@@ -138,6 +185,30 @@ test("runSetup applies the plan and is idempotent", () => {
         a.reason.startsWith("already linked")
     )
   );
+});
+
+test("runSetup replaces legacy symlinked .gemini with isolated directory", () => {
+  const sb = makeSandbox();
+  const agyPrimary = path.join(sb.agentMuxHome, "profiles", "antigravity", "primary");
+  fs.mkdirSync(agyPrimary, { recursive: true });
+  fs.symlinkSync(path.join(sb.realHome, ".gemini"), path.join(agyPrimary, ".gemini"));
+  assert.ok(fs.lstatSync(path.join(agyPrimary, ".gemini")).isSymbolicLink());
+
+  runSetup(opts(sb, { log: () => {} }));
+
+  assert.ok(fs.lstatSync(path.join(agyPrimary, ".gemini")).isDirectory());
+  assert.ok(!fs.lstatSync(path.join(agyPrimary, ".gemini")).isSymbolicLink());
+  assert.ok(
+    fs.existsSync(path.join(agyPrimary, ".gemini", "antigravity-cli", "settings.json"))
+  );
+  const primaryToken = path.join(
+    agyPrimary,
+    ".gemini",
+    "antigravity-cli",
+    "antigravity-oauth-token"
+  );
+  assert.ok(fs.lstatSync(primaryToken).isFile());
+  assert.ok(!fs.lstatSync(primaryToken).isSymbolicLink());
 });
 
 test("planSetup preserves real provider binaries before wiring wrappers", () => {

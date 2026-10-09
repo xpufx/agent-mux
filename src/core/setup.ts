@@ -6,7 +6,7 @@ import { getRealHome, getAgentMuxHome, COMMON_DOTFILES } from "./paths.js";
 export type SetupProvider = "all" | "antigravity" | "opencode";
 
 export interface SetupAction {
-  kind: "mkdir" | "symlink" | "copy" | "move" | "chmod" | "skip";
+  kind: "mkdir" | "symlink" | "copy" | "move" | "chmod" | "skip" | "rm";
   target: string;
   source?: string;
   noClobber?: boolean;
@@ -101,8 +101,23 @@ function findOnPath(binary: string, pathEnv: string, exclude?: string): string |
   return undefined;
 }
 
+function isAncestorRemoved(ctx: PlanContext, p: string): boolean {
+  return ctx.actions.some(
+    (a) => a.kind === "rm" && (p === a.target || p.startsWith(a.target + path.sep))
+  );
+}
+
+function targetExistsOnDisk(ctx: PlanContext, target: string): boolean {
+  if (!lexists(target)) return false;
+  if (isAncestorRemoved(ctx, target)) return false;
+  return true;
+}
+
 function planMkdir(ctx: PlanContext, dir: string, reason: string): void {
-  if (fs.existsSync(dir) || ctx.plannedDirs.has(dir)) return;
+  if (ctx.plannedDirs.has(dir)) return;
+  if (lexists(dir) && !isSymlink(dir) && fs.lstatSync(dir).isDirectory()) {
+    if (!isAncestorRemoved(ctx, dir)) return;
+  }
   ctx.actions.push({ kind: "mkdir", target: dir, reason });
   ctx.plannedDirs.add(dir);
 }
@@ -113,24 +128,26 @@ function planSymlink(
   target: string,
   reason: string
 ): void {
-  if (
-    ctx.plannedDirs.has(target) ||
-    [...ctx.plannedDirs].some((dir) => dir.startsWith(target + path.sep))
-  ) {
-    ctx.actions.push({ kind: "skip", target, reason: "target is a managed directory" });
-    return;
-  }
-  if (isSymlink(target)) {
-    if (symlinkPointsTo(target, source)) {
-      ctx.actions.push({ kind: "skip", target, source, reason: `already linked to ${source}` });
-    } else {
-      ctx.actions.push({ kind: "symlink", target, source, reason });
+  if (!isAncestorRemoved(ctx, target)) {
+    if (
+      ctx.plannedDirs.has(target) ||
+      [...ctx.plannedDirs].some((dir) => dir.startsWith(target + path.sep))
+    ) {
+      ctx.actions.push({ kind: "skip", target, reason: "target is a managed directory" });
+      return;
     }
-    return;
-  }
-  if (lexists(target) && fs.lstatSync(target).isDirectory()) {
-    ctx.actions.push({ kind: "skip", target, reason: "existing directory left untouched" });
-    return;
+    if (isSymlink(target)) {
+      if (symlinkPointsTo(target, source)) {
+        ctx.actions.push({ kind: "skip", target, source, reason: `already linked to ${source}` });
+      } else {
+        ctx.actions.push({ kind: "symlink", target, source, reason });
+      }
+      return;
+    }
+    if (lexists(target) && fs.lstatSync(target).isDirectory()) {
+      ctx.actions.push({ kind: "skip", target, reason: "existing directory left untouched" });
+      return;
+    }
   }
   ctx.actions.push({ kind: "symlink", target, source, reason });
 }
@@ -142,7 +159,7 @@ function planCopy(
   reason: string,
   opts: { noClobber?: boolean } = {}
 ): void {
-  if (opts.noClobber && (lexists(target) || ctx.plannedDirs.has(target))) {
+  if (opts.noClobber && (targetExistsOnDisk(ctx, target) || ctx.plannedDirs.has(target))) {
     ctx.actions.push({ kind: "skip", target, source, reason: `already present at ${target}` });
     return;
   }
@@ -186,43 +203,61 @@ function planAntigravity(ctx: PlanContext, roots: ResolvedRoots, accounts: strin
   planMkdir(ctx, agyProfiles, "antigravity profile base");
 
   const primary = accounts[0];
-  const primaryDir = path.join(agyProfiles, primary);
-
-  // Primary profile inherits the live ~/.gemini and shared dotfiles.
-  planMkdir(ctx, primaryDir, `primary antigravity profile ${primary}`);
-  planSymlink(
-    ctx,
-    path.join(roots.realHome, ".gemini"),
-    path.join(primaryDir, ".gemini"),
-    "share live ~/.gemini with primary profile"
+  const realConversations = path.join(
+    roots.realHome,
+    ".gemini",
+    "antigravity-cli",
+    "conversations"
   );
-  planDotfileLinks(ctx, roots.realHome, primaryDir);
+  const realConfig = path.join(roots.realHome, ".gemini", "config");
+  const realSettings = path.join(roots.realHome, ".gemini", "antigravity-cli", "settings.json");
+  const realToken = path.join(
+    roots.realHome,
+    ".gemini",
+    "antigravity-cli",
+    "antigravity-oauth-token"
+  );
 
-  // Remaining profiles keep isolated auth but share conversations/config.
-  for (const prof of accounts.slice(1)) {
+  // All profiles keep isolated auth but share conversations and config.
+  for (const prof of accounts) {
     const profDir = path.join(agyProfiles, prof);
-    const cliDir = path.join(profDir, ".gemini", "antigravity-cli");
+    planMkdir(ctx, profDir, `antigravity profile ${prof}`);
+
+    const geminiDir = path.join(profDir, ".gemini");
+    if (isSymlink(geminiDir)) {
+      ctx.actions.push({
+        kind: "rm",
+        target: geminiDir,
+        reason: "replace shared .gemini symlink with isolated directory"
+      });
+    }
+
+    const cliDir = path.join(geminiDir, "antigravity-cli");
     planMkdir(ctx, cliDir, `antigravity profile ${prof}`);
 
-    const realSettings = path.join(roots.realHome, ".gemini", "antigravity-cli", "settings.json");
     if (fs.existsSync(realSettings)) {
       planCopy(ctx, realSettings, path.join(cliDir, "settings.json"), `seed ${prof} settings`, {
         noClobber: true
       });
     }
-    planSymlink(
-      ctx,
-      path.join(roots.realHome, ".gemini", "config"),
-      path.join(profDir, ".gemini", "config"),
-      "share ~/.gemini/config"
-    );
+    if (prof === primary && fs.existsSync(realToken)) {
+      planCopy(
+        ctx,
+        realToken,
+        path.join(cliDir, "antigravity-oauth-token"),
+        "seed primary auth token",
+        { noClobber: true }
+      );
+    }
+    if (fs.existsSync(realConfig)) {
+      planSymlink(
+        ctx,
+        realConfig,
+        path.join(geminiDir, "config"),
+        "share ~/.gemini/config"
+      );
+    }
 
-    const realConversations = path.join(
-      roots.realHome,
-      ".gemini",
-      "antigravity-cli",
-      "conversations"
-    );
     planMkdir(ctx, realConversations, "shared antigravity conversations");
     planSymlink(
       ctx,
@@ -419,6 +454,13 @@ function applyPlan(plan: SetupAction[], dryRun: boolean, log: (line: string) => 
       case "chmod": {
         if (!dryRun) fs.chmodSync(action.target, 0o755);
         log(`${prefix} chmod +x ${action.target}`);
+        break;
+      }
+      case "rm": {
+        if (!dryRun) {
+          fs.rmSync(action.target, { recursive: true, force: true });
+        }
+        log(`${prefix} rm ${action.target}`);
         break;
       }
       case "skip": {

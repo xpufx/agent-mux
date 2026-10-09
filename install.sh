@@ -62,19 +62,18 @@ if [[ "$TARGET_PROVIDER" == "all" || "$TARGET_PROVIDER" == "antigravity" ]]; the
   mkdir -p "$AGY_PROFILES"
   PRIMARY="${ACCOUNTS[0]}"
 
-  # Primary profile
-  mkdir -p "$AGY_PROFILES/$PRIMARY"
-  ln -sfn "$REAL_HOME/.gemini" "$AGY_PROFILES/$PRIMARY/.gemini"
-  for dot in .gitconfig .git-credentials .ssh .local .config .bashrc .profile .agents; do
-    [[ -e "$REAL_HOME/$dot" ]] && ln -sfn "$REAL_HOME/$dot" "$AGY_PROFILES/$PRIMARY/$dot"
-  done
-
-  # Remaining profiles
-  for prof in "${ACCOUNTS[@]:1}"; do
+  # All profiles keep isolated auth but share conversations and config.
+  for prof in "${ACCOUNTS[@]}"; do
+    if [[ -L "$AGY_PROFILES/$prof/.gemini" ]]; then
+      rm -f "$AGY_PROFILES/$prof/.gemini"
+    fi
     mkdir -p "$AGY_PROFILES/$prof/.gemini/antigravity-cli"
     [[ -f "$REAL_HOME/.gemini/antigravity-cli/settings.json" ]] && \
       cp -n "$REAL_HOME/.gemini/antigravity-cli/settings.json" "$AGY_PROFILES/$prof/.gemini/antigravity-cli/settings.json" 2>/dev/null || true
-    ln -sfn "$REAL_HOME/.gemini/config" "$AGY_PROFILES/$prof/.gemini/config"
+    if [[ "$prof" == "$PRIMARY" && -f "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" ]]; then
+      cp -n "$REAL_HOME/.gemini/antigravity-cli/antigravity-oauth-token" "$AGY_PROFILES/$prof/.gemini/antigravity-cli/antigravity-oauth-token" 2>/dev/null || true
+    fi
+    [[ -d "$REAL_HOME/.gemini/config" ]] && ln -sfn "$REAL_HOME/.gemini/config" "$AGY_PROFILES/$prof/.gemini/config"
 
     mkdir -p "$REAL_HOME/.gemini/antigravity-cli/conversations"
     if [[ ! -L "$AGY_PROFILES/$prof/.gemini/antigravity-cli/conversations" ]]; then
