@@ -14,6 +14,24 @@ export const AGY_SCOPED_AUTH_PATHS = [
   ".gemini/antigravity-cli/antigravity-oauth-token"
 ];
 
+/**
+ * Subcommands supported by agy that do not take prompt inference `--model` flags.
+ */
+export const AGY_NON_PROMPT_SUBCOMMANDS = new Set([
+  "models",
+  "agent",
+  "agents",
+  "changelog",
+  "help",
+  "install",
+  "mcp",
+  "mic-serve",
+  "plugin",
+  "plugins",
+  "remote-control",
+  "update"
+]);
+
 export const BWRAP_REQUIRED_MESSAGE =
   "[agent-mux] Error: 'bwrap' (bubblewrap) is required for isolation_mode 'scoped', " +
   "but was not found in PATH.\n" +
