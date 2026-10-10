@@ -368,29 +368,30 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         process.stdout.write(line + "\n");
       });
 
-      proc.on("close", async (code) => {
-        if (isRelaunching) return;
-        if (proc.pid && killedChildPids.has(proc.pid)) return;
+proc.on("close", async (code) => {
+         if (isRelaunching) return;
+         if (proc.pid && killedChildPids.has(proc.pid)) return;
 
-        // Clean exit: do not attempt quota relaunch
-        if (code === 0) {
-          process.off("SIGINT", onSigInt);
-          process.off("SIGTERM", onSigTerm);
-          resolve(0);
-          return;
-        }
+         // Check for quota error in stderr regardless of exit code.
+         // A process may exit 0 but still have printed a quota failure to stderr.
+         const crashLine = isProcessCrashQuotaError(stderrLines);
+         if (crashLine) {
+           await handleRelaunch("Process exited with quota limit", prof, pool, crashLine);
+           return;
+         }
 
-        // Check if process crashed due to quota error during active turn
-        const crashLine = isProcessCrashQuotaError(stderrLines);
-        if (lastUserMessage && crashLine) {
-          await handleRelaunch("Process exited with quota limit", prof, pool, crashLine);
-          return;
-        }
+         // Clean exit: no quota signal in stderr
+         if (code === 0) {
+           process.off("SIGINT", onSigInt);
+           process.off("SIGTERM", onSigTerm);
+           resolve(0);
+           return;
+         }
 
-        process.off("SIGINT", onSigInt);
-        process.off("SIGTERM", onSigTerm);
-        resolve(code ?? 0);
-      });
+         process.off("SIGINT", onSigInt);
+         process.off("SIGTERM", onSigTerm);
+         resolve(code ?? 0);
+       });
     }
 
     async function handleRelaunch(
@@ -416,25 +417,13 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         Array.from(triedCandidates)
       );
 
-      // If all candidates are in cooldown or already tried, STOP. Do not flap!
-      if (decision.allCooldown || triedCandidates.has(candidateKey(decision.profile, decision.pool))) {
-        logMuxMessage("SUPERVISOR", `All candidates for requested pool '${targetPool}' in cooldown or already tried. Stopping failover.`);
-        process.stderr.write(
-          `\n\x1b[31;1m[agent-mux] QUOTA EXHAUSTED: ${reason} on ${failedProfile} (pool: ${failedPool}).\x1b[0m\n` +
-          `\x1b[33mAll candidates in the configured failover order are currently in cooldown or rate-limited.\x1b[0m\n` +
-          `\x1b[90mSuggested actions:\x1b[0m\n` +
-          `  1. Check quota recovery:   \x1b[36magent-mux status ${adapter.id}\x1b[0m\n` +
-          `  2. View active cooldowns:  \x1b[36magent-mux cooldowns\x1b[0m\n` +
-          (targetPool === "claude"
-            ? `  3. Switch model pool:      \x1b[36m--model gemini-2.5-pro\x1b[0m (Gemini pool often has quota)\n`
-            : "") +
-          `  4. Clear cooldown locks:   \x1b[36magent-mux cooldowns clear\x1b[0m (if provider quota reset)\n` +
-          `  5. Add another account:    \x1b[36magent-mux profile add ${adapter.id} <account>\x1b[0m\n\n`
-        );
-        if (rawErrorLine) {
-          process.stdout.write(rawErrorLine + "\n");
-        }
-        return;
+      // If all candidates are in cooldown, selectProfile returns the one with
+      // the shortest remaining cooldown (bestCandidate). Proceed with that
+      // candidate rather than aborting — it will become healthy soonest.
+      // The triedCandidates.has check is redundant because selectProfile
+      // already excludes tried candidates via the excludeCandidates parameter.
+      if (decision.allCooldown) {
+        logMuxMessage("SUPERVISOR", `All candidates for requested pool '${targetPool}' in cooldown; failing over to shortest cooldown: ${decision.profile} (pool: ${decision.pool}, ${decision.reason})`);
       }
 
       isRelaunching = true;
