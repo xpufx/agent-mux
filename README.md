@@ -87,6 +87,9 @@ Clients (Paseo, Terminal, Automation)
 | OpenCode | `opencode` | `~/.local/bin/opencode` | `.local/share/opencode/auth.json` | Account isolation, log rate-limit detection, model probing |
 | Pi | `pi` | `~/.local/bin/pi` | `.pi/agent/auth.json` | Dual-pool (default vs free), per-provider key isolation |
 
+Command Code account quota, usage, and pricing endpoints are documented in
+[docs/commandcode.md](docs/commandcode.md).
+
 ---
 
 ## Install (npm)
@@ -355,6 +358,14 @@ AGENT_MUX_ROUTING_POLICY=pool-spillover agy -p "echo hi"
 | `AGENT_MUX_ROUTING_POLICY` | Overrides `routingPolicy` (`pool-strict`, `pool-spillover`, `account-first`) | Config file / `pool-strict` |
 | `AGENT_MUX_PROFILE` | Forces execution to a specific account profile | Auto-routed |
 | `AGY_TARGET_POOL` | Overrides target pool selection (`gemini` or `claude`) | Derived from `--model` |
+
+---
+
+## Documentation
+
+| Document | Description |
+| :--- | :--- |
+| [docs/commandcode.md](docs/commandcode.md) | Command Code alpha API reference: authentication, quota/usage/billing endpoints, pricing caveats, and `agent-mux` / `pi-commandcode-provider` integration |
 
 ---
 
