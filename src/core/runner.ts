@@ -4,7 +4,10 @@ import { runSupervisor } from "./supervisor.js";
 import { getIsolationMode } from "./config.js";
 import { parseArgs, type MuxFlags } from "./args.js";
 import type { ProviderAdapter } from "../types.js";
+import { AGENT_MUX_VERSION } from "./version.js";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 
 export interface ExecutionOptions {
   adapter: ProviderAdapter;
@@ -18,7 +21,7 @@ export interface ExecutionOptions {
  * and direct agent-mux CLI invocations (agent-mux run/exec/<provider>).
  *
  * Preserves 100% native CLI fidelity:
- *   - Only strips/handles explicit mux flags (--profile, --pool, --round-robin/--rr)
+ *   - Only strips/handles explicit mux flags (--profile, --pool, --round-robin/--rr, --mux-version)
  *   - Passes all native arguments, subcommands, and flags through to the target binary
  *   - Leaves subcommands and info requests (--help, --version) free of injected model flags
  *   - Bypasses multiplexing recursion when running inside an isolated profile environment
@@ -33,6 +36,11 @@ export async function executeProvider(
     typeof providerIdOrAdapter === "string"
       ? getProviderAdapter(providerIdOrAdapter)
       : providerIdOrAdapter;
+
+  if (rawArgs.includes("--mux-version")) {
+    console.log(`agent-mux v${AGENT_MUX_VERSION} (wrapper: ${adapter.displayName} [${adapter.id}] -> ${adapter.defaultBinaryPath})`);
+    return 0;
+  }
 
   // Bypass router if already executing within an isolated profile
   const home = env.HOME || "";
@@ -130,3 +138,26 @@ export async function executeProvider(
     });
   });
 }
+
+/**
+ * Determine if a binary path is an agent-mux wrapper.
+ */
+export function isBinaryWrapped(filePath: string): boolean {
+  try {
+    const realTarget = fs.realpathSync(filePath);
+    const baseName = path.basename(realTarget);
+    if (baseName === "agent-mux" || baseName.endsWith("-mux")) {
+      return true;
+    }
+    const buf = fs.readFileSync(realTarget);
+    // If it starts with the ELF magic header, it's a native compiled binary
+    if (buf.length >= 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46) {
+      return false;
+    }
+    const sample = buf.subarray(0, 4096).toString("utf-8");
+    return sample.includes("agent-mux") || sample.includes("executeProvider");
+  } catch {
+    return false;
+  }
+}
+

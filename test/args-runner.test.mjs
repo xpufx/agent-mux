@@ -159,3 +159,45 @@ test("executeProvider - does not inject model flags for subcommands or --help / 
   await executeProvider(mockAdapter, ["-p", "hi"], { ...process.env });
   assert.deepEqual(executedArgs, ["-p", "hi", "--model", "gemini-model-override"]);
 });
+
+test("executeProvider - handles --mux-version with exit 0", async () => {
+  const { AGENT_MUX_VERSION } = await import("../dist/index.js");
+  let logged = "";
+  const origLog = console.log;
+  console.log = (msg) => { logged = msg; };
+  try {
+    const adapter = {
+      id: "agy",
+      displayName: "Antigravity",
+      binaryName: "agy",
+      defaultBinaryPath: "/bin/true",
+      profilesBaseDir: "/tmp",
+      getAuthStatus: async () => true,
+      getQuotaStatus: async () => [],
+      resolveTargetPool: () => "default",
+      getSupportedPools: () => ["default"],
+      getSharedPaths: () => []
+    };
+    const code = await executeProvider(adapter, ["--mux-version"]);
+    assert.equal(code, 0);
+    assert.ok(logged.includes(AGENT_MUX_VERSION));
+    assert.ok(logged.includes("wrapper: Antigravity"));
+  } finally {
+    console.log = origLog;
+  }
+});
+
+test("isBinaryWrapped - detects wrapper script vs native binary", async () => {
+  const { isBinaryWrapped } = await import("../dist/index.js");
+  const wrapperFile = path.join(tmpHome, "mock-wrapper");
+  fs.writeFileSync(wrapperFile, "#!/usr/bin/env node\n// agent-mux wrapper\nimport { executeProvider } from './core/runner.js';\n");
+
+  const nativeFile = path.join(tmpHome, "mock-native");
+  // Write ELF header bytes
+  fs.writeFileSync(nativeFile, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]));
+
+  assert.equal(isBinaryWrapped(wrapperFile), true);
+  assert.equal(isBinaryWrapped(nativeFile), false);
+  assert.equal(isBinaryWrapped("/nonexistent/file"), false);
+});
+

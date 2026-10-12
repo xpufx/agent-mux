@@ -14,8 +14,10 @@ import { parseResetDurationSeconds } from "../core/supervisor.js";
 import { clearCooldown } from "../core/state.js";
 import { recordCooldownFamily } from "../core/pools.js";
 import { spawn } from "node:child_process";
-import { executeProvider } from "../core/runner.js";
+import { executeProvider, isBinaryWrapped } from "../core/runner.js";
 import { parseArgs } from "../core/args.js";
+import { AGENT_MUX_VERSION } from "../core/version.js";
+import { findExecutableInPath } from "../providers/antigravity.js";
 
 import {
   loadConfig,
@@ -86,6 +88,26 @@ async function runProbe(providerId: string, profile?: string, pool?: string) {
   }
 }
 
+async function handleWrappersCommand() {
+  const providers = listSupportedProviders();
+  console.log("=== agent-mux CLI Wrappers ===");
+  for (const prov of providers) {
+    const binName = prov.binaryName;
+    const resolved = findExecutableInPath(binName);
+    if (!resolved) {
+      console.log(`  • ${binName.padEnd(10)} [NOT FOUND in PATH]`);
+      continue;
+    }
+    const isWrapped = isBinaryWrapped(resolved);
+    const target = prov.defaultBinaryPath;
+    if (isWrapped) {
+      console.log(`  • ${binName.padEnd(10)} \x1b[32m[WRAPPED]\x1b[0m   ${resolved} -> ${target}`);
+    } else {
+      console.log(`  • ${binName.padEnd(10)} \x1b[33m[UNWRAPPED]\x1b[0m ${resolved}`);
+    }
+  }
+}
+
 import {
   loadCooldowns,
   clearCooldownsMatching
@@ -99,6 +121,7 @@ Usage:
   agent-mux status [provider] [--probe]       View quota and auth status (instant; --probe to check early reset)
   agent-mux probe <provider> [profile] [pool] Actively test live model/server access
   agent-mux models <provider> [--free]        List models available in CLI (optionally free only)
+  agent-mux wrappers                          Inspect whether binaries on PATH are wrapped
   agent-mux profile list [provider]           List configured profiles with auth + directory state
   agent-mux profile add <name> [--provider <p>]    Scaffold a new account profile
   agent-mux profile auth <name> [--provider <p>]   Launch isolated login for a profile
@@ -413,6 +436,16 @@ async function main() {
   if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") {
     printHelp();
     process.exit(0);
+  }
+
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+    console.log(`agent-mux v${AGENT_MUX_VERSION}`);
+    process.exit(0);
+  }
+
+  if (cmd === "wrappers" || cmd === "wrapper") {
+    await handleWrappersCommand();
+    return;
   }
 
   if (cmd === "profile" || cmd === "profiles") {
