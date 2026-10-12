@@ -83,7 +83,9 @@ export async function selectProfile(
   mode: "auto" | "round-robin" | string = "auto",
   excludeCandidates: string[] = [],
   policy: RoutingPolicy = getRoutingPolicy(),
-  poolOverride?: string
+  poolOverride?: string,
+  /** When provided, the caller owns the selection log (e.g. to dedupe it). */
+  onSelect?: (decision: RoutingDecision) => void
 ): Promise<RoutingDecision & { allCooldown?: boolean }> {
   const inferredPool = adapter.resolveTargetPool(args, env);
   if (poolOverride !== undefined) {
@@ -201,10 +203,12 @@ export async function selectProfile(
         pool: chosen.pool,
         reason: `Round-robin rotation (${chosen.profile}/${chosen.pool})`
       };
-      logMuxMessage(
-        "ROUTER",
-        `Selected ${decision.profile}/${decision.pool} for pool ${targetPool} [${policy}] (${decision.reason})`
-      );
+      if (onSelect) onSelect(decision);
+      else
+        logMuxMessage(
+          "ROUTER",
+          `Selected ${decision.profile}/${decision.pool} for pool ${targetPool} [${policy}] (${decision.reason})`
+        );
       return decision;
     }
 
@@ -215,10 +219,12 @@ export async function selectProfile(
       pool: chosen.pool,
       reason: chosen.reason
     };
-    logMuxMessage(
-      "ROUTER",
-      `Selected ${decision.profile}/${decision.pool} for pool ${targetPool} [${policy}] (${decision.reason})`
-    );
+    if (onSelect) onSelect(decision);
+    else
+      logMuxMessage(
+        "ROUTER",
+        `Selected ${decision.profile}/${decision.pool} for pool ${targetPool} [${policy}] (${decision.reason})`
+      );
     return decision;
   }
 
@@ -243,9 +249,11 @@ export async function selectProfile(
     reason: `All candidates in cooldown; selected shortest wait (${bestCandidate.remainingSec}s on ${bestCandidate.profile}/${bestCandidate.pool})`,
     allCooldown: true
   };
-  logMuxMessage(
-    "ROUTER",
-    `Fallback selection (ALL COOLDOWN) [${policy}]: ${decision.profile}/${decision.pool} (${decision.reason})`
-  );
+  if (onSelect) onSelect(decision);
+  else
+    logMuxMessage(
+      "ROUTER",
+      `Fallback selection (ALL COOLDOWN) [${policy}]: ${decision.profile}/${decision.pool} (${decision.reason})`
+    );
   return decision;
 }

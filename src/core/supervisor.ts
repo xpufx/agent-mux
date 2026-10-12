@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import path from "node:path";
-import type { ProviderAdapter } from "../types.js";
+import type { ProviderAdapter, RoutingDecision } from "../types.js";
 import { listProfiles, ensureProfile } from "./profiles.js";
 import {
   getSurfaceAccountMode,
@@ -101,6 +101,39 @@ export function isProcessCrashQuotaError(stderrLines: string[]): string | undefi
   return undefined;
 }
 
+export function isDebugLoggingEnabled(): boolean {
+  return Boolean(process.env.DEBUG || process.env.AGENT_MUX_DEBUG);
+}
+
+export interface CandidateSelectionLogger {
+  log(profile: string, pool: string, reason: string): boolean;
+  lastSelected(): string | null;
+}
+
+/**
+ * Emits a single 'Selected candidate ...' line per `(profile, pool)`
+ * transition. Consecutive turns that keep the same candidate stay quiet
+ * unless DEBUG or AGENT_MUX_DEBUG is set, so the active decision remains
+ * visible without flooding the log on every turn.
+ */
+export function createCandidateSelectionLogger(
+  write: (message: string) => void = (message) => logMuxMessage("SUPERVISOR", message)
+): CandidateSelectionLogger {
+  let last: string | null = null;
+  return {
+    log(profile: string, pool: string, reason: string): boolean {
+      const key = candidateKey(profile, pool);
+      if (key === last && !isDebugLoggingEnabled()) return false;
+      last = key;
+      write(`Selected candidate ${profile} (pool: ${pool}): ${reason}`);
+      return true;
+    },
+    lastSelected(): string | null {
+      return last;
+    }
+  };
+}
+
 export interface SupervisorOptions {
   adapter: ProviderAdapter;
   initialProfile: string;
@@ -177,6 +210,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   let lastUserMessage: string | null = null;
   let activeChildStderr: string[] = [];
   const killedChildPids = new Set<number>();
+  const selectionLogger = createCandidateSelectionLogger();
   let isRelaunching = false;
   let relaunchCount = 0;
   const triedCandidates = new Set<string>([candidateKey(currentProfile, currentPool)]);
@@ -238,10 +272,9 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
     const stderrLines: string[] = [];
     proc.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString();
-      process.stderr.write(text);
-      stderrLines.push(text);
-      if (stderrLines.length > 25) stderrLines.shift();
+      // Buffer the whole turn: a quota failure that failover recovers from
+      // must never reach the calling harness as a raw error banner.
+      stderrLines.push(chunk.toString());
     });
 
     return { proc, stderrLines };
@@ -250,6 +283,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   const initialSpawn = spawnChild(currentProfile);
   child = initialSpawn.proc;
   activeChildStderr = initialSpawn.stderrLines;
+  selectionLogger.log(currentProfile, currentPool, "initial selection");
 
   // Pipe stdin from parent to active child
   const parentStdinLines = readline.createInterface({ input: process.stdin });
@@ -259,6 +293,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       if (data.event === "user") {
         lastUserMessage = line;
         activeChildStderr.length = 0; // Clear stale stderr from previous turns
+        selectionLogger.log(currentProfile, currentPool, "active candidate for turn");
         turnSurfaced = false;
         turnMessagePrefixed = false;
         turnHadOutput = false;
@@ -289,6 +324,22 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   process.on("SIGTERM", onSigTerm);
 
   return new Promise<number>((resolve) => {
+    function flushBufferedStderr(buffer: string[]): void {
+      if (buffer.length === 0) return;
+      const text = buffer.join("");
+      buffer.length = 0;
+      try {
+        process.stderr.write(text);
+      } catch {}
+    }
+
+    function flushTurnStderr(buffer: string[]): void {
+      // A turn that still carries a quota signal stays buffered: the child may
+      // exit next and failover could still recover it.
+      if (isProcessCrashQuotaError(buffer)) return;
+      flushBufferedStderr(buffer);
+    }
+
     function attachStdoutListener(proc: ChildProcess, stderrLines: string[], prof: string, pool: string) {
       const rl = readline.createInterface({ input: proc.stdout! });
 
@@ -329,6 +380,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               relaunchCount = 0;
               triedCandidates.clear();
               triedCandidates.add(candidateKey(currentProfile, currentPool));
+              flushTurnStderr(stderrLines);
             }
           } else if (eventType === "error" && isQuotaError(parsedFrame.error)) {
             quotaDetected = true;
@@ -337,7 +389,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         } catch {}
 
         if (quotaDetected) {
-          await handleRelaunch("Quota exhausted", prof, pool, errorDetails, line);
+          await handleRelaunch("Quota exhausted", prof, pool, errorDetails, line, stderrLines);
           return;
         }
 
@@ -380,9 +432,12 @@ proc.on("close", async (code) => {
          // A process may exit 0 but still have printed a quota failure to stderr.
          const crashLine = isProcessCrashQuotaError(stderrLines);
          if (crashLine) {
-           await handleRelaunch("Process exited with quota limit", prof, pool, crashLine);
+           await handleRelaunch("Process exited with quota limit", prof, pool, crashLine, undefined, stderrLines);
            return;
          }
+
+         // Terminal (non-quota) exit: release everything the turn buffered.
+         flushBufferedStderr(stderrLines);
 
          // Clean exit: no quota signal in stderr
          if (code === 0) {
@@ -403,7 +458,8 @@ proc.on("close", async (code) => {
       failedProfile: string,
       failedPool: string,
       errorDetails?: string,
-      rawErrorLine?: string
+      rawErrorLine?: string,
+      bufferedStderr: string[] = []
     ) {
       if (isRelaunching) return;
 
@@ -412,16 +468,38 @@ proc.on("close", async (code) => {
       recordCooldownFamily(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
       triedCandidates.add(candidateKey(failedProfile, failedPool));
 
-      // Check if a healthy fallback exists in the policy-ordered candidate matrix
-      const decision = await selectProfile(
-        adapter,
-        args,
-        options.env || process.env,
-        "auto",
-        Array.from(triedCandidates),
-        getRoutingPolicy(),
-        options.poolOverride
-      );
+      // Check if a healthy fallback exists in the policy-ordered candidate
+      // matrix. The supervisor owns the selection log so repeated turns on the
+      // same candidate do not spam it.
+      let decision: RoutingDecision & { allCooldown?: boolean };
+      try {
+        decision = await selectProfile(
+          adapter,
+          args,
+          options.env || process.env,
+          "auto",
+          Array.from(triedCandidates),
+          getRoutingPolicy(),
+          options.poolOverride,
+          (d) => selectionLogger.log(d.profile, d.pool, d.reason)
+        );
+      } catch (err) {
+        // Failover could not be scheduled: the failure is terminal, so the raw
+        // buffered stderr must reach the caller.
+        flushBufferedStderr(bufferedStderr);
+        logMuxMessage("SUPERVISOR", `Failover failed: ${(err as Error)?.message ?? String(err)}`);
+        isRelaunching = true;
+        if (child) {
+          try {
+            if (child.pid) killedChildPids.add(child.pid);
+            child.kill("SIGTERM");
+          } catch {}
+        }
+        process.off("SIGINT", onSigInt);
+        process.off("SIGTERM", onSigTerm);
+        resolve(1);
+        return;
+      }
 
       // If all candidates are in cooldown, selectProfile returns the one with
       // the shortest remaining cooldown (bestCandidate). Proceed with that
@@ -429,7 +507,13 @@ proc.on("close", async (code) => {
       // The triedCandidates.has check is redundant because selectProfile
       // already excludes tried candidates via the excludeCandidates parameter.
       if (decision.allCooldown) {
+        // Failover is not clean here, so keep the raw quota output visible.
+        flushBufferedStderr(bufferedStderr);
         logMuxMessage("SUPERVISOR", `All candidates for requested pool '${targetPool}' in cooldown; failing over to shortest cooldown: ${decision.profile} (pool: ${decision.pool}, ${decision.reason})`);
+      } else {
+        // Recovered automatically: drop the failed candidate's raw stderr so
+        // the caller never sees a transient quota banner.
+        bufferedStderr.length = 0;
       }
 
       isRelaunching = true;
