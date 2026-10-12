@@ -381,4 +381,13 @@ export class PiAdapter implements ProviderAdapter {
     const allModels = await this.listModels(profile);
     return allModels.filter((m) => m.endsWith(":free") || m.endsWith("-free"));
   }
+
+  isStreamCommand(args: string[]): boolean {
+    return args.includes("stream-json");
+  }
+
+  isNonPromptSubcommand(subCmd: string): boolean {
+    return PI_NON_PROMPT_SUBCOMMANDS.has(subCmd);
+  }
 }
+

@@ -1,10 +1,11 @@
-import { getProviderAdapter, listSupportedProviders, AGY_NON_PROMPT_SUBCOMMANDS, PI_NON_PROMPT_SUBCOMMANDS } from "../providers/index.js";
+import { getProviderAdapter, listSupportedProviders } from "../providers/index.js";
 import { getProviderStatus, listProfiles } from "../core/profiles.js";
-import { selectProfile, applyPoolModel } from "../core/router.js";
-import { runSupervisor, parseResetDurationSeconds } from "../core/supervisor.js";
+import { parseResetDurationSeconds } from "../core/supervisor.js";
 import { clearCooldown } from "../core/state.js";
 import { recordCooldownFamily } from "../core/pools.js";
 import { spawn } from "node:child_process";
+import { executeProvider } from "../core/runner.js";
+import { parseArgs } from "../core/args.js";
 
 import {
   loadConfig,
@@ -75,82 +76,6 @@ async function runProbe(providerId: string, profile?: string, pool?: string) {
   }
 }
 
-async function executeProvider(providerId: string, rawArgs: string[]) {
-  const adapter = getProviderAdapter(providerId);
-
-  // Parse routing flags (--profile/--round-robin/--pool are mux flags,
-  // never passed to the underlying CLI).
-  let mode = "auto";
-  let poolOverride: string | undefined;
-  const cmdArgs: string[] = [];
-  let isStreamJson = false;
-
-  for (let i = 0; i < rawArgs.length; i++) {
-    const arg = rawArgs[i];
-    if (arg === "--profile" && i + 1 < rawArgs.length) {
-      mode = rawArgs[++i];
-    } else if (arg === "--round-robin" || arg === "--rr") {
-      mode = "round-robin";
-    } else if (arg === "--pool" && i + 1 < rawArgs.length) {
-      poolOverride = rawArgs[++i];
-    } else {
-      if (arg === "stream-json") isStreamJson = true;
-      cmdArgs.push(arg);
-    }
-  }
-
-  const subCmd = cmdArgs.find((a) => !a.startsWith("-"));
-  const isAgySubcommand =
-    adapter.id === "antigravity" &&
-    subCmd !== undefined &&
-    AGY_NON_PROMPT_SUBCOMMANDS.has(subCmd);
-  const isPiSubcommand =
-    adapter.id === "pi" &&
-    subCmd !== undefined &&
-    PI_NON_PROMPT_SUBCOMMANDS.has(subCmd);
-
-  const decision = await selectProfile(adapter, cmdArgs, process.env, mode, [], undefined, poolOverride);
-  const execArgs = isAgySubcommand || isPiSubcommand ? [...cmdArgs] : applyPoolModel(adapter, cmdArgs, decision.pool);
-
-  if (isStreamJson) {
-    const code = await runSupervisor({
-      adapter,
-      initialProfile: decision.profile,
-      initialPool: decision.pool,
-      poolOverride,
-      binaryPath: adapter.defaultBinaryPath,
-      args: cmdArgs
-    });
-    process.exit(code);
-  } else {
-    const profDir = `${adapter.profilesBaseDir}/${decision.profile}`;
-    const isolationMode = getIsolationMode();
-    let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
-
-    if (adapter.prepareExecution) {
-      execTarget = adapter.prepareExecution(decision.profile, execArgs, process.env, isolationMode);
-    } else {
-      execTarget = {
-        binary: adapter.defaultBinaryPath,
-        args: execArgs,
-        env: {
-          ...process.env,
-          HOME: profDir
-        }
-      };
-    }
-
-    const child = spawn(execTarget.binary, execTarget.args, {
-      stdio: "inherit",
-      env: execTarget.env
-    });
-
-    child.on("close", (code) => {
-      process.exit(code ?? 0);
-    });
-  }
-}
-
 import {
   loadCooldowns,
   clearCooldownsMatching
@@ -174,8 +99,9 @@ Usage:
   agent-mux setup [--dry-run]                 Configure profiles and wrappers (idempotent)
   agent-mux logs [--tail <n>] [-f]            View agent-mux routing and failover logs
   agent-mux config [list|get|set]             Manage global configuration
-  agent-mux run <provider> [options] [args]   Run provider binary with auto-routing
-  agent-mux <provider> [args]                 Shorthand for run (e.g. agent-mux agy ...)
+  agent-mux exec <provider> [options] [--] [args] Run provider binary with auto-routing
+  agent-mux run <provider> [options] [args]   Alias for exec
+  agent-mux <provider> [options] [args]       Shorthand for exec (e.g. agent-mux agy ...)
 
 Providers:
   antigravity, agy                            Google Antigravity CLI
@@ -192,6 +118,7 @@ Examples:
   agent-mux status                            View all accounts and live quota limits
   agent-mux agy -p "echo hi"                  Auto-route to healthy account and run
   agent-mux agy --profile secondary           Run using a specific account profile
+  agent-mux exec agy --profile p2 -- -p "hi"  Explicit exec with literal arguments
   agy --profile primary -p "inspect git"      Direct transparent wrapper invocation
   agent-mux profile list                      List all accounts and authenticating emails
   agent-mux setup                             Configure profiles and transparent wrappers
@@ -388,7 +315,15 @@ Actions:
 }
 
 async function main() {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+  const parsedTop = parseArgs(rawArgs);
+  const topFlags = {
+    profile: parsedTop.profile,
+    pool: parsedTop.pool,
+    roundRobin: parsedTop.roundRobin,
+    mode: parsedTop.mode
+  };
+  const args = parsedTop.cmdArgs;
   const cmd = args[0];
 
   if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") {
@@ -585,19 +520,20 @@ async function main() {
     return;
   }
 
-  if (cmd === "run") {
+  if (cmd === "run" || cmd === "exec") {
     if (!args[1]) {
-      console.error("Usage: agent-mux run <provider> [args...]");
+      console.error(`Usage: agent-mux ${cmd} <provider> [options] [--] [args...]`);
       process.exit(1);
     }
-    await executeProvider(args[1], args.slice(2));
-    return;
+    const code = await executeProvider(args[1], args.slice(2), process.env, topFlags);
+    process.exit(code);
   }
 
   // Direct provider shorthand: agent-mux agy [args...]
   try {
     getProviderAdapter(cmd);
-    await executeProvider(cmd, args.slice(1));
+    const code = await executeProvider(cmd, args.slice(1), process.env, topFlags);
+    process.exit(code);
   } catch {
     console.error(`Unknown command or provider: ${cmd}`);
     process.exit(1);

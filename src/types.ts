@@ -46,6 +46,8 @@ export interface ProviderAdapter {
    * getSupportedPools(); adapters should refresh their cache here.
    */
   discoverPools?(profile?: string): Promise<string[]>;
+  isStreamCommand?(args: string[]): boolean;
+  isNonPromptSubcommand?(subcommand: string): boolean;
 }
 
 export interface RoutingDecision {

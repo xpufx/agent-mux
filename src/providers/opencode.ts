@@ -325,4 +325,13 @@ export class OpenCodeAdapter implements ProviderAdapter {
       return { state: "UNKNOWN", details: err.message || "Probe failed" };
     }
   }
+
+  isStreamCommand(args: string[]): boolean {
+    return args.some((a) => a === "acp" || a === "serve" || a === "stream-json");
+  }
+
+  isNonPromptSubcommand(_subCmd: string): boolean {
+    return false;
+  }
 }
+

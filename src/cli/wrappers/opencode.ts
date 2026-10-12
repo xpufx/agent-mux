@@ -1,86 +1,11 @@
-import { getProviderAdapter } from "../../providers/index.js";
-import { selectProfile, applyPoolModel } from "../../core/router.js";
-import { runSupervisor } from "../../core/supervisor.js";
-import { spawn } from "node:child_process";
-
-import { getIsolationMode } from "../../core/config.js";
+import { executeProvider } from "../../core/runner.js";
 
 async function main() {
-  const rawArgs = process.argv.slice(2);
-  const adapter = getProviderAdapter("opencode");
-
-  // Bypass router if already in an isolated profile
-  const home = process.env.HOME || "";
-  if (home.includes("/.agent-mux/")) {
-    const child = spawn(adapter.defaultBinaryPath, rawArgs, { stdio: "inherit" });
-    child.on("close", (code) => process.exit(code ?? 0));
-    return;
-  }
-
-  // Parse routing flags (--profile/--round-robin/--pool are wrapper flags,
-  // never passed to the underlying CLI).
-  let mode = "auto";
-  let poolOverride: string | undefined;
-  const cmdArgs: string[] = [];
-  let isStream = false;
-
-  for (let i = 0; i < rawArgs.length; i++) {
-    const arg = rawArgs[i];
-    if (arg === "--profile" && i + 1 < rawArgs.length) {
-      mode = rawArgs[++i];
-    } else if (arg === "--round-robin" || arg === "--rr") {
-      mode = "round-robin";
-    } else if (arg === "--pool" && i + 1 < rawArgs.length) {
-      poolOverride = rawArgs[++i];
-    } else {
-      if (arg === "acp" || arg === "serve" || arg === "stream-json") isStream = true;
-      cmdArgs.push(arg);
-    }
-  }
-
-  const decision = await selectProfile(adapter, cmdArgs, process.env, mode, [], undefined, poolOverride);
-  const execArgs = applyPoolModel(adapter, cmdArgs, decision.pool);
-
-  if (isStream) {
-    const code = await runSupervisor({
-      adapter,
-      initialProfile: decision.profile,
-      initialPool: decision.pool,
-      poolOverride,
-      binaryPath: adapter.defaultBinaryPath,
-      args: cmdArgs
-    });
-    process.exit(code);
-  } else {
-    const profDir = `${adapter.profilesBaseDir}/${decision.profile}`;
-    const isolationMode = getIsolationMode();
-    let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
-
-    if (adapter.prepareExecution) {
-      execTarget = adapter.prepareExecution(decision.profile, execArgs, process.env, isolationMode);
-    } else {
-      execTarget = {
-        binary: adapter.defaultBinaryPath,
-        args: execArgs,
-        env: {
-          ...process.env,
-          HOME: profDir
-        }
-      };
-    }
-
-    const child = spawn(execTarget.binary, execTarget.args, {
-      stdio: "inherit",
-      env: execTarget.env
-    });
-
-    child.on("close", (code) => {
-      process.exit(code ?? 0);
-    });
-  }
+  const code = await executeProvider("opencode", process.argv.slice(2));
+  process.exit(code);
 }
 
 main().catch((err) => {
-  console.error("[opencode-mux error]", err.message);
+  console.error("[opencode error]", err.message);
   process.exit(1);
 });

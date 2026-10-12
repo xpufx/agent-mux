@@ -360,4 +360,13 @@ export class AntigravityAdapter implements ProviderAdapter {
       "claude-opus-4-6"
     ];
   }
+
+  isStreamCommand(args: string[]): boolean {
+    return args.includes("stream-json");
+  }
+
+  isNonPromptSubcommand(subCmd: string): boolean {
+    return AGY_NON_PROMPT_SUBCOMMANDS.has(subCmd);
+  }
 }
+
