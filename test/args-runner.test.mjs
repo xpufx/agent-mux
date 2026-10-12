@@ -7,6 +7,9 @@ import os from "node:os";
 // Test-isolated environment
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "agent-mux-args-runner-test-"));
 process.env.AGENT_MUX_HOME = tmpHome;
+// Running the suite from inside an agent-mux profile session leaks this marker;
+// clear it so routing tests are deterministic (the bypass test sets it itself).
+delete process.env.AGENT_MUX_ACTIVE_PROFILE;
 
 const {
   parseArgs,

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getAgentMuxHome } from "./paths.js";
+import type { ProfileRecord } from "./profiles.js";
 
 export type SurfaceAccountMode = "tool" | "message" | "both" | "none";
 export type IsolationMode = "scoped" | "home";
@@ -10,6 +11,8 @@ export interface AgentMuxConfig {
   surface_account?: SurfaceAccountMode;
   isolation_mode?: IsolationMode;
   routingPolicy?: RoutingPolicy;
+  /** Registry of profiles created through the CLI (directory presence is still authoritative). */
+  profiles?: ProfileRecord[];
   [key: string]: unknown;
 }
 

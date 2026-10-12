@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getRealHome, getAgentMuxHome, COMMON_DOTFILES } from "./paths.js";
+import { getIsolationMode } from "./config.js";
 
 export type SetupProvider = "all" | "antigravity" | "opencode" | "pi";
 
@@ -29,6 +30,17 @@ interface PlanContext {
   actions: SetupAction[];
   /** Directories the plan will create; treated as present during planning. */
   plannedDirs: Set<string>;
+}
+
+function hasBwrapInPath(pathEnv: string): boolean {
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    try {
+      fs.accessSync(path.join(dir, "bwrap"), fs.constants.X_OK);
+      return true;
+    } catch {}
+  }
+  return false;
 }
 
 function defaultDistDir(): string {
@@ -628,6 +640,17 @@ export function runSetup(options: SetupOptions = {}): SetupAction[] {
   log(`Base Directory : ${agentMuxHome}`);
   log(`Local Bin      : ${localBin}`);
   log("");
+
+  // Scoped isolation relies on bubblewrap; warn once here so bootstrap and the
+  // CLI share the same pre-flight instead of duplicating it in install.sh.
+  const pathEnv = options.pathEnv ?? process.env.PATH ?? "";
+  if (getIsolationMode() === "scoped" && !hasBwrapInPath(pathEnv)) {
+    log("[!] WARNING: 'bwrap' (bubblewrap) was not found in PATH.");
+    log("    The default isolation_mode 'scoped' requires it for provider execution.");
+    log("    Install:  sudo apt install bubblewrap  |  sudo pacman -S bubblewrap  |  sudo dnf install bubblewrap");
+    log("    Fallback: agent-mux config set isolation_mode home");
+    log("");
+  }
 
   applyPlan(plan, dryRun, log);
 

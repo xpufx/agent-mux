@@ -1,5 +1,15 @@
 import { getProviderAdapter, listSupportedProviders } from "../providers/index.js";
-import { getProviderStatus, listProfiles } from "../core/profiles.js";
+import {
+  getProviderStatus,
+  listProfiles,
+  listProfileInventory,
+  addProfile,
+  removeProfile,
+  authenticateProfile,
+  detectSandbox,
+  SANDBOX_GUARD_MESSAGE,
+  type ProfileInfo
+} from "../core/profiles.js";
 import { parseResetDurationSeconds } from "../core/supervisor.js";
 import { clearCooldown } from "../core/state.js";
 import { recordCooldownFamily } from "../core/pools.js";
@@ -81,7 +91,6 @@ import {
   clearCooldownsMatching
 } from "../core/state.js";
 import { runSetup } from "../core/setup.js";
-import { ensureProfile, removeProfile } from "../core/profiles.js";
 
 function printHelp() {
   console.log(`agent-mux - Multi-Account Multiplexer and Stream Supervisor
@@ -90,10 +99,10 @@ Usage:
   agent-mux status [provider] [--probe]       View quota and auth status (instant; --probe to check early reset)
   agent-mux probe <provider> [profile] [pool] Actively test live model/server access
   agent-mux models <provider> [--free]        List models available in CLI (optionally free only)
-  agent-mux profile list [provider]           List all configured account profiles
-  agent-mux profile add <provider> <name>     Scaffold a new account profile
-  agent-mux profile auth <provider> <name>    Launch interactive login for a profile
-  agent-mux profile remove <provider> <name>  Delete an account profile
+  agent-mux profile list [provider]           List configured profiles with auth + directory state
+  agent-mux profile add <name> [--provider <p>]    Scaffold a new account profile
+  agent-mux profile auth <name> [--provider <p>]   Launch isolated login for a profile
+  agent-mux profile remove <name> [--provider <p>] Delete a profile directory and config entry
   agent-mux cooldowns [list]                  View active cooldown locks and reset times
   agent-mux cooldowns clear [provider] [profile] [pool]  Clear cooldown locks (scoped)
   agent-mux setup [--dry-run]                 Configure profiles and wrappers (idempotent)
@@ -139,6 +148,96 @@ Environment Variables:
 `);
 }
 
+const SETUP_PROVIDERS = new Set(["all", "antigravity", "agy", "opencode", "pi"]);
+
+function normalizeSetupProvider(
+  value?: string
+): "all" | "antigravity" | "opencode" | "pi" | undefined {
+  if (!value) return undefined;
+  const normalized = value.toLowerCase();
+  if (normalized === "agy") return "antigravity";
+  if (normalized === "all" || normalized === "antigravity" || normalized === "opencode" || normalized === "pi") {
+    return normalized;
+  }
+  console.error(`Unknown setup provider '${value}'. Use one of: all, antigravity, opencode, pi.`);
+  process.exit(1);
+}
+
+function guardHostProfileCommand(action: string): void {
+  const detection = detectSandbox();
+  if (!detection.sandboxed) return;
+  console.error(`\x1b[31m[!] ${SANDBOX_GUARD_MESSAGE}\x1b[0m`);
+  console.error(
+    `    '${action}' cannot run here${detection.reason ? ` (${detection.reason})` : ""}.`
+  );
+  process.exit(1);
+}
+
+function parseProfileTarget(
+  args: string[],
+  action: string
+): { provider: string; name: string } | null {
+  let provider: string | undefined;
+  const positionals: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--provider" || arg === "-P") {
+      provider = args[++i];
+      continue;
+    }
+    if (arg.startsWith("--provider=")) {
+      provider = arg.slice("--provider=".length);
+      continue;
+    }
+    if (arg.startsWith("-")) continue;
+    positionals.push(arg);
+  }
+
+  if (positionals.length >= 2) {
+    return { provider: positionals[0], name: positionals[1] };
+  }
+  if (positionals.length === 1 && provider) {
+    return { provider, name: positionals[0] };
+  }
+
+  console.error(
+    `Usage: agent-mux profile ${action} <name> --provider <provider>\n` +
+      `       agent-mux profile ${action} <provider> <name>`
+  );
+  return null;
+}
+
+function printProfileInventory(inventory: ProfileInfo[]): void {
+  const byProvider = new Map<string, ProfileInfo[]>();
+  for (const info of inventory) {
+    const list = byProvider.get(info.provider) ?? [];
+    list.push(info);
+    byProvider.set(info.provider, list);
+  }
+
+  if (byProvider.size === 0) {
+    console.log("  (No profiles configured)");
+    return;
+  }
+
+  for (const [providerId, profiles] of byProvider) {
+    console.log(`\nProvider: ${profiles[0].providerLabel} (${providerId})`);
+    for (const info of profiles) {
+      const status = !info.directoryExists
+        ? "\x1b[31mmissing directory\x1b[0m"
+        : info.authenticated
+          ? "\x1b[32mAuthenticated\x1b[0m"
+          : "\x1b[33mPending login\x1b[0m";
+      const identity = info.accountIdentity ? ` \x1b[90m(${info.accountIdentity})\x1b[0m` : "";
+      const registered = info.registered ? "" : " \x1b[90m[unregistered]\x1b[0m";
+      console.log(
+        `  • ${info.name.padEnd(16)} [${status}]${identity}${registered} -> ${info.directory}`
+      );
+    }
+  }
+}
+
 async function handleProfileCommand(args: string[]) {
   const sub = args[0] || "list";
 
@@ -146,102 +245,87 @@ async function handleProfileCommand(args: string[]) {
     console.log(`Usage: agent-mux profile <action> [options]
 
 Actions:
-  list [provider]                  List configured account profiles
-  add <provider> <name>            Scaffold a new account profile
-  auth <provider> <name>           Launch interactive login for a profile
-  remove <provider> <name>         Delete an account profile (aliases: rm, delete)
+  list [provider]                        List configured account profiles
+  add <name> [--provider <provider>]     Scaffold a new account profile
+  auth <name> [--provider <provider>]    Launch isolated login for a profile
+  remove <name> [--provider <provider>]  Delete a profile directory and config entry
+                                         (aliases: rm, delete)
+
+Legacy positional form: profile <action> <provider> <name>
 `);
     return;
   }
 
   if (sub === "list") {
-    const providerId = args[1];
+    const providerId = args.slice(1).find((a) => !a.startsWith("-"));
     const providers = providerId
       ? [getProviderAdapter(providerId)]
       : listSupportedProviders();
 
+    const detection = detectSandbox();
+    if (detection.sandboxed) {
+      console.log(`\x1b[33m[!] ${SANDBOX_GUARD_MESSAGE}\x1b[0m`);
+      console.log(
+        `    Listing from a sandboxed session${detection.reason ? ` (${detection.reason})` : ""}; results may be incomplete.\n`
+      );
+    }
+
     const activeIso = getIsolationMode();
     console.log(`=== Configured Account Profiles [Isolation Mode: ${activeIso}] ===`);
-    for (const prov of providers) {
-      console.log(`\nProvider: ${prov.displayName} (${prov.id})`);
-      console.log(`Base directory: ${prov.profilesBaseDir}`);
-      const profiles = listProfiles(prov);
-      if (profiles.length === 0) {
-        console.log("  (No profiles configured)");
-        continue;
-      }
-      for (const prof of profiles) {
-        const auth = await prov.getAuthStatus(prof);
-        const statusStr = auth ? "\x1b[32mAuthenticated\x1b[0m" : "\x1b[33mPending login\x1b[0m";
-        const identity = prov.getAccountIdentity ? await prov.getAccountIdentity(prof) : undefined;
-        const idStr = identity ? ` \x1b[90m(${identity})\x1b[0m` : "";
-        console.log(`  • ${prof.padEnd(16)} [${statusStr}]${idStr} -> ${prov.profilesBaseDir}/${prof}`);
-      }
-    }
+    printProfileInventory(await listProfileInventory(providers));
     return;
   }
 
   if (sub === "add") {
-    const provId = args[1];
-    const profName = args[2];
-    if (!provId || !profName) {
-      console.error("Usage: agent-mux profile add <provider> <profile-name>");
+    guardHostProfileCommand("profile add");
+    const target = parseProfileTarget(args.slice(1), "add");
+    if (!target) {
       process.exit(1);
     }
-    const adapter = getProviderAdapter(provId);
-    const createdPath = ensureProfile(adapter, profName);
-    console.log(`\x1b[32m[+] Profile '${profName}' scaffolded successfully for ${adapter.displayName}.\x1b[0m`);
-    console.log(`    Location: ${createdPath}`);
+    const adapter = getProviderAdapter(target.provider);
+    const result = addProfile(adapter, target.name);
+    console.log(
+      `\x1b[32m[+] Profile '${target.name}' ${result.created ? "scaffolded" : "already exists"} for ${adapter.displayName}.\x1b[0m`
+    );
+    console.log(`    Location: ${result.directory}`);
     console.log(`\nTo authenticate this profile, run:`);
-    console.log(`    agent-mux profile auth ${adapter.id} ${profName}`);
+    console.log(`    agent-mux profile auth ${target.name} --provider ${adapter.id}`);
     return;
   }
 
   if (sub === "auth") {
-    const provId = args[1];
-    const profName = args[2];
-    if (!provId || !profName) {
-      console.error("Usage: agent-mux profile auth <provider> <profile-name>");
+    guardHostProfileCommand("profile auth");
+    const target = parseProfileTarget(args.slice(1), "auth");
+    if (!target) {
       process.exit(1);
     }
-    const adapter = getProviderAdapter(provId);
-    const profDir = ensureProfile(adapter, profName);
+    const adapter = getProviderAdapter(target.provider);
 
-    console.log(`\x1b[36m[*] Launching interactive authentication for ${adapter.displayName} (profile: ${profName})...\x1b[0m`);
-    console.log(`    HOME=${profDir}`);
+    console.log(
+      `\x1b[36m[*] Launching isolated authentication for ${adapter.displayName} (profile: ${target.name})...\x1b[0m`
+    );
 
-    const child = spawn(adapter.defaultBinaryPath, adapter.authArgs ?? ["auth"], {
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        HOME: profDir
-      }
-    });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        console.log(`\x1b[32m[✓] Authentication process completed for ${profName}.\x1b[0m`);
-      } else {
-        console.log(`\x1b[33m[!] Authentication process exited with code ${code}.\x1b[0m`);
-      }
-      process.exit(code ?? 0);
-    });
-    return;
+    const code = await authenticateProfile(adapter, target.name);
+    if (code === 0) {
+      console.log(`\x1b[32m[✓] Authentication process completed for ${target.name}.\x1b[0m`);
+    } else {
+      console.log(`\x1b[33m[!] Authentication process exited with code ${code}.\x1b[0m`);
+    }
+    process.exit(code);
   }
 
   if (sub === "remove" || sub === "delete" || sub === "rm") {
-    const provId = args[1];
-    const profName = args[2];
-    if (!provId || !profName) {
-      console.error("Usage: agent-mux profile remove <provider> <profile-name>");
+    guardHostProfileCommand("profile remove");
+    const target = parseProfileTarget(args.slice(1), "remove");
+    if (!target) {
       process.exit(1);
     }
-    const adapter = getProviderAdapter(provId);
-    const removed = removeProfile(adapter, profName);
+    const adapter = getProviderAdapter(target.provider);
+    const removed = removeProfile(adapter, target.name);
     if (removed) {
-      console.log(`\x1b[32m[✓] Profile '${profName}' removed successfully from ${adapter.displayName}.\x1b[0m`);
+      console.log(`\x1b[32m[✓] Profile '${target.name}' removed successfully from ${adapter.displayName}.\x1b[0m`);
     } else {
-      console.log(`\x1b[33m[!] Profile '${profName}' does not exist for ${adapter.displayName}.\x1b[0m`);
+      console.log(`\x1b[33m[!] Profile '${target.name}' does not exist for ${adapter.displayName}.\x1b[0m`);
     }
     return;
   }
@@ -466,8 +550,36 @@ async function main() {
   }
 
   if (cmd === "setup") {
+    guardHostProfileCommand("setup");
     const dryRun = args.includes("--dry-run");
-    runSetup({ dryRun });
+    const positionals: string[] = [];
+    let provider: string | undefined;
+
+    for (let i = 1; i < args.length; i++) {
+      const arg = args[i];
+      if (arg === "--dry-run") continue;
+      if (arg === "--provider" || arg === "-p") {
+        provider = args[++i];
+        continue;
+      }
+      if (arg.startsWith("--provider=")) {
+        provider = arg.slice("--provider=".length);
+        continue;
+      }
+      if (arg.startsWith("-")) continue;
+      positionals.push(arg);
+    }
+
+    // First positional may be a provider keyword (legacy install.sh contract).
+    if (!provider && positionals.length > 0 && SETUP_PROVIDERS.has(positionals[0].toLowerCase())) {
+      provider = positionals.shift();
+    }
+
+    runSetup({
+      dryRun,
+      provider: normalizeSetupProvider(provider),
+      accounts: positionals
+    });
     return;
   }
 
