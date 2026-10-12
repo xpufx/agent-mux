@@ -12,6 +12,7 @@ function makeDist(root) {
   fs.writeFileSync(path.join(distDir, "cli.js"), "// agent-mux cli\n");
   fs.writeFileSync(path.join(distDir, "wrappers", "agy.js"), "// agy wrapper\n");
   fs.writeFileSync(path.join(distDir, "wrappers", "opencode.js"), "// opencode wrapper\n");
+  fs.writeFileSync(path.join(distDir, "wrappers", "pi.js"), "// pi wrapper\n");
   return distDir;
 }
 

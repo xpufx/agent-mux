@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getRealHome, getAgentMuxHome, COMMON_DOTFILES } from "./paths.js";
 
-export type SetupProvider = "all" | "antigravity" | "opencode";
+export type SetupProvider = "all" | "antigravity" | "opencode" | "pi";
 
 export interface SetupAction {
   kind: "mkdir" | "symlink" | "copy" | "move" | "chmod" | "skip" | "rm";
@@ -384,6 +384,141 @@ function planOpenCode(ctx: PlanContext, roots: ResolvedRoots, accounts: string[]
 }
 
 /**
+ * Resolve a path's ultimate target for wrapper-ownership checks. Returns
+ * undefined when the path cannot be resolved.
+ */
+function realTarget(p: string): string | undefined {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return undefined;
+  }
+}
+
+function isMuxWrapper(resolvedPath: string): boolean {
+  return resolvedPath.includes("-mux") || resolvedPath.includes("agent-mux");
+}
+
+/**
+ * Find a provider binary on PATH, following symlinks (npm/system shims are
+ * symlinks) but skipping anything that resolves to one of our own wrappers.
+ */
+function findNonMuxOnPath(
+  binary: string,
+  pathEnv: string,
+  wrapperNames: string[]
+): string | undefined {
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, binary);
+    if (!lexists(candidate)) continue;
+    const real = realTarget(candidate);
+    if (!real) continue;
+    if (isMuxWrapper(real)) continue;
+    if (wrapperNames.some((w) => real.endsWith(w))) continue;
+    return candidate;
+  }
+  return undefined;
+}
+
+function planPi(ctx: PlanContext, roots: ResolvedRoots, accounts: string[]): void {
+  const piProfiles = path.join(roots.agentMuxHome, "profiles", "pi");
+  planMkdir(ctx, piProfiles, "pi profile base");
+
+  const realAgentDir = path.join(roots.realHome, ".pi", "agent");
+  const realAuth = path.join(realAgentDir, "auth.json");
+  const realSettings = path.join(realAgentDir, "settings.json");
+  // models.json declares user-configured providers (e.g. orcarouter); without
+  // it a profile only sees the built-in provider catalog.
+  const realModelsJson = path.join(realAgentDir, "models.json");
+  // Provider packages and extensions are shared: pi auto-installs the
+  // provider package (e.g. pi-commandcode-provider) under this dir on first
+  // use, so every profile must see the same tree instead of npm-installing
+  // its own copy.
+  const realNpm = path.join(realAgentDir, "npm");
+  const realExtensions = path.join(realAgentDir, "extensions");
+
+  const primary = accounts[0];
+  const primaryDir = path.join(piProfiles, primary);
+  const primaryAgentDir = path.join(primaryDir, ".pi", "agent");
+
+  planMkdir(ctx, primaryAgentDir, `primary pi profile ${primary}`);
+
+  // Seed primary credentials and defaults (pi resolves providers from
+  // settings.json packages, so it must exist for auth checks to work).
+  if (fs.existsSync(realAuth)) {
+    planCopy(ctx, realAuth, path.join(primaryAgentDir, "auth.json"), "seed primary auth", {
+      noClobber: true
+    });
+  }
+  if (fs.existsSync(realSettings)) {
+    planCopy(ctx, realSettings, path.join(primaryAgentDir, "settings.json"), "seed primary settings", {
+      noClobber: true
+    });
+  }
+  if (fs.existsSync(realModelsJson)) {
+    planCopy(ctx, realModelsJson, path.join(primaryAgentDir, "models.json"), "seed primary provider defs", {
+      noClobber: true
+    });
+  }
+  if (fs.existsSync(realNpm)) {
+    planSymlink(ctx, realNpm, path.join(primaryAgentDir, "npm"), "share provider packages");
+  }
+  if (fs.existsSync(realExtensions)) {
+    planSymlink(ctx, realExtensions, path.join(primaryAgentDir, "extensions"), "share extensions");
+  }
+  planDotfileLinks(ctx, roots.realHome, primaryDir);
+
+  // Remaining profiles: isolated auth, shared defaults.
+  for (const prof of accounts.slice(1)) {
+    const profDir = path.join(piProfiles, prof);
+    const profAgentDir = path.join(profDir, ".pi", "agent");
+    planMkdir(ctx, profAgentDir, `pi profile ${prof}`);
+    if (fs.existsSync(realSettings)) {
+      planCopy(ctx, realSettings, path.join(profAgentDir, "settings.json"), "seed profile settings", {
+        noClobber: true
+      });
+    }
+    if (fs.existsSync(realModelsJson)) {
+      planCopy(ctx, realModelsJson, path.join(profAgentDir, "models.json"), "seed profile provider defs", {
+        noClobber: true
+      });
+    }
+    if (fs.existsSync(realNpm)) {
+      planSymlink(ctx, realNpm, path.join(profAgentDir, "npm"), "share provider packages");
+    }
+    if (fs.existsSync(realExtensions)) {
+      planSymlink(ctx, realExtensions, path.join(profAgentDir, "extensions"), "share extensions");
+    }
+    planDotfileLinks(ctx, roots.realHome, profDir);
+  }
+
+  // Preserve the real pi binary before wiring the wrapper. pi ships as a Node
+  // ESM shim (symlink), so accept symlinks — just never our own wrapper.
+  const targetPi = path.join(roots.localBin, "pi");
+  const realPi = path.join(roots.localBin, "pi.bin");
+  const targetReal = lexists(targetPi) ? realTarget(targetPi) : undefined;
+  if (targetReal && !isMuxWrapper(targetReal) && !isSymlink(targetPi)) {
+    ctx.actions.push({
+      kind: "move",
+      source: targetPi,
+      target: realPi,
+      reason: "preserve real pi binary"
+    });
+  } else if (!lexists(realPi)) {
+    const sysPi = findNonMuxOnPath("pi", roots.pathEnv, ["pi-mux", "agent-mux"]);
+    if (sysPi) {
+      planSymlink(ctx, sysPi, realPi, "link system pi as pi.bin");
+    }
+  }
+
+  const targetMux = path.join(roots.localBin, "pi-mux");
+  planCopy(ctx, path.join(roots.distDir, "wrappers", "pi.js"), targetMux, "install pi wrapper");
+  ctx.actions.push({ kind: "chmod", target: targetMux, reason: "make pi wrapper executable" });
+  planSymlink(ctx, targetMux, targetPi, "wire pi wrapper onto PATH");
+}
+
+/**
  * Compute the full set of filesystem actions needed to mirror install.sh.
  * Read-only: performs no writes, so it is safe to call with `--dry-run`.
  */
@@ -406,6 +541,9 @@ export function planSetup(options: SetupOptions = {}): SetupAction[] {
   }
   if (provider === "all" || provider === "opencode") {
     planOpenCode(ctx, roots, accounts);
+  }
+  if (provider === "all" || provider === "pi") {
+    planPi(ctx, roots, accounts);
   }
 
   // Install the main CLI plus its legacy agy-profile alias.

@@ -1,13 +1,16 @@
 import type { ProviderAdapter } from "../types.js";
 import { AntigravityAdapter } from "./antigravity.js";
 import { OpenCodeAdapter } from "./opencode.js";
+import { PiAdapter } from "./pi.js";
 
 export * from "./antigravity.js";
+export * from "./pi.js";
 
 const adapters: Record<string, ProviderAdapter> = {
   antigravity: new AntigravityAdapter(),
   agy: new AntigravityAdapter(),
-  opencode: new OpenCodeAdapter()
+  opencode: new OpenCodeAdapter(),
+  pi: new PiAdapter()
 };
 
 export function getProviderAdapter(id: string): ProviderAdapter {
@@ -22,5 +25,5 @@ export function getProviderAdapter(id: string): ProviderAdapter {
 }
 
 export function listSupportedProviders(): ProviderAdapter[] {
-  return [new AntigravityAdapter(), new OpenCodeAdapter()];
+  return [new AntigravityAdapter(), new OpenCodeAdapter(), new PiAdapter()];
 }

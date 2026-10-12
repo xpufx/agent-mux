@@ -25,6 +25,8 @@ export interface ProviderAdapter {
   
   getAuthStatus(profile: string): Promise<boolean>;
   getAccountIdentity?(profile: string): Promise<string | undefined>;
+  /** Extra CLI args for interactive login (default: ["auth"]). */
+  authArgs?: string[];
   getQuotaStatus(profile: string): Promise<PoolQuota[]>;
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string;
   getSharedPaths(): string[];
@@ -38,6 +40,12 @@ export interface ProviderAdapter {
   ): { binary: string; args: string[]; env: NodeJS.ProcessEnv };
   probe?(profile: string, pool: string): Promise<{ state: QuotaState; details: string }>;
   listModels?(profile?: string): Promise<string[]>;
+  /**
+   * Full dynamic pool list (e.g. inner providers of a meta-harness).
+   * Called on demand when an explicitly requested pool is not in
+   * getSupportedPools(); adapters should refresh their cache here.
+   */
+  discoverPools?(profile?: string): Promise<string[]>;
 }
 
 export interface RoutingDecision {

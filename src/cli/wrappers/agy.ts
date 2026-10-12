@@ -31,8 +31,10 @@ async function main() {
     return;
   }
 
-  // Parse routing flags
+  // Parse routing flags (--profile/--round-robin/--pool are wrapper flags,
+  // never passed to the underlying CLI).
   let mode = "auto";
+  let poolOverride: string | undefined;
   const cmdArgs: string[] = [];
   let isStreamJson = false;
 
@@ -42,6 +44,8 @@ async function main() {
       mode = rawArgs[++i];
     } else if (arg === "--round-robin" || arg === "--rr") {
       mode = "round-robin";
+    } else if (arg === "--pool" && i + 1 < rawArgs.length) {
+      poolOverride = rawArgs[++i];
     } else {
       if (arg === "stream-json") isStreamJson = true;
       cmdArgs.push(arg);
@@ -51,7 +55,7 @@ async function main() {
   const subCmd = cmdArgs.find((a) => !a.startsWith("-"));
   const isSubcommand = subCmd !== undefined && AGY_NON_PROMPT_SUBCOMMANDS.has(subCmd);
 
-  const decision = await selectProfile(adapter, cmdArgs, process.env, mode);
+  const decision = await selectProfile(adapter, cmdArgs, process.env, mode, [], undefined, poolOverride);
   const execArgs = isSubcommand ? [...cmdArgs] : applyPoolModel(adapter, cmdArgs, decision.pool);
 
   if (isStreamJson) {
@@ -59,6 +63,7 @@ async function main() {
       adapter,
       initialProfile: decision.profile,
       initialPool: decision.pool,
+      poolOverride,
       binaryPath: adapter.defaultBinaryPath,
       args: cmdArgs
     });

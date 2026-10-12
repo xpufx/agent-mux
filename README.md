@@ -85,6 +85,7 @@ Clients (Paseo, Terminal, Automation)
 | :--- | :--- | :--- | :--- | :--- |
 | Google Antigravity | `antigravity`, `agy` | `~/.local/bin/agy` | `.gemini/antigravity-cli/antigravity-oauth-token` | Dual-pool (Gemini vs Claude) via glog UTC timestamps |
 | OpenCode | `opencode` | `~/.local/bin/opencode` | `.local/share/opencode/auth.json` | Account isolation, log rate-limit detection, model probing |
+| Pi | `pi` | `~/.local/bin/pi` | `.pi/agent/auth.json` | Dual-pool (default vs free), per-provider key isolation |
 
 ---
 

@@ -7,7 +7,8 @@
   "bin": {
     "agent-mux": "./dist/cli.js",
     "agy-mux": "./dist/wrappers/agy.js",
-    "opencode-mux": "./dist/wrappers/opencode.js"
+    "opencode-mux": "./dist/wrappers/opencode.js",
+    "pi-mux": "./dist/wrappers/pi.js"
   },
   "files": [
     "dist",

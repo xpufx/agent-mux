@@ -82,9 +82,23 @@ export async function selectProfile(
   env: NodeJS.ProcessEnv,
   mode: "auto" | "round-robin" | string = "auto",
   excludeCandidates: string[] = [],
-  policy: RoutingPolicy = getRoutingPolicy()
+  policy: RoutingPolicy = getRoutingPolicy(),
+  poolOverride?: string
 ): Promise<RoutingDecision & { allCooldown?: boolean }> {
-  const targetPool = adapter.resolveTargetPool(args, env);
+  const inferredPool = adapter.resolveTargetPool(args, env);
+  if (poolOverride !== undefined) {
+    let supported = adapter.getSupportedPools?.() ?? [];
+    if (!supported.includes(poolOverride) && adapter.discoverPools) {
+      // Cold cache: discover dynamic (inner-provider) pools on demand.
+      supported = await adapter.discoverPools();
+    }
+    if (!supported.includes(poolOverride)) {
+      throw new Error(
+        `Unknown pool '${poolOverride}' for provider '${adapter.id}'. Available pools: ${supported.join(", ")}`
+      );
+    }
+  }
+  const targetPool = poolOverride ?? inferredPool;
   const allProfiles = listProfiles(adapter);
 
   if (allProfiles.length === 0) {

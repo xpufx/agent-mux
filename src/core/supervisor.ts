@@ -6,9 +6,11 @@ import { listProfiles, ensureProfile } from "./profiles.js";
 import {
   getSurfaceAccountMode,
   getIsolationMode,
+  getRoutingPolicy,
   type SurfaceAccountMode
 } from "./config.js";
-import { recordCooldown, logMuxMessage } from "./state.js";
+import { logMuxMessage } from "./state.js";
+import { recordCooldownFamily } from "./pools.js";
 import { selectProfile, candidateKey, applyPoolModel } from "./router.js";
 import { parseResetDurationSeconds } from "./cooldown.js";
 
@@ -103,6 +105,8 @@ export interface SupervisorOptions {
   adapter: ProviderAdapter;
   initialProfile: string;
   initialPool?: string;
+  /** Explicit pool request (e.g. from --pool); falls back to model inference. */
+  poolOverride?: string;
   binaryPath: string;
   args: string[];
   env?: NodeJS.ProcessEnv;
@@ -154,7 +158,7 @@ export function buildAccountToolFrame(
 export async function runSupervisor(options: SupervisorOptions): Promise<number> {
   const { adapter, binaryPath, args } = options;
   const surfaceMode = options.surfaceAccount ?? getSurfaceAccountMode();
-  const targetPool = adapter.resolveTargetPool(args, options.env || process.env);
+  const targetPool = options.poolOverride ?? adapter.resolveTargetPool(args, options.env || process.env);
   let currentProfile = options.initialProfile;
   // The requested pool stays fixed for the whole session so the policy candidate
   // matrix is always built against the original request, not the current fallback.
@@ -405,7 +409,7 @@ proc.on("close", async (code) => {
 
       const durSec = parseResetDurationSeconds(errorDetails || "");
       logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails}`);
-      recordCooldown(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
+      recordCooldownFamily(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
       triedCandidates.add(candidateKey(failedProfile, failedPool));
 
       // Check if a healthy fallback exists in the policy-ordered candidate matrix
@@ -414,7 +418,9 @@ proc.on("close", async (code) => {
         args,
         options.env || process.env,
         "auto",
-        Array.from(triedCandidates)
+        Array.from(triedCandidates),
+        getRoutingPolicy(),
+        options.poolOverride
       );
 
       // If all candidates are in cooldown, selectProfile returns the one with

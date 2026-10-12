@@ -5,6 +5,7 @@ await esbuild.build({
     cli: "src/cli/index.ts",
     "wrappers/agy": "src/cli/wrappers/agy.ts",
     "wrappers/opencode": "src/cli/wrappers/opencode.ts",
+    "wrappers/pi": "src/cli/wrappers/pi.ts",
     index: "src/index.ts"
   },
   bundle: true,

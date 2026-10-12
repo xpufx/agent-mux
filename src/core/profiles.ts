@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getRealHome, COMMON_DOTFILES } from "./paths.js";
-import { checkCooldown, clearCooldown, recordCooldown } from "./state.js";
+import { checkCooldown, clearCooldown } from "./state.js";
+import { recordCooldownFamily } from "./pools.js";
 import { parseResetDurationSeconds } from "./cooldown.js";
 import type { ProviderAdapter, ProfileStatus } from "../types.js";
 
@@ -84,7 +85,7 @@ export async function getProviderStatus(
         if (probe.state === "READY") {
           clearCooldown(adapter.id, prof, p.pool);
         } else if (probe.state === "LIMIT") {
-          recordCooldown(
+          recordCooldownFamily(
             adapter.id,
             prof,
             p.pool,

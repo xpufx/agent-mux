@@ -5,6 +5,16 @@ import type { ProviderAdapter, PoolQuota, QuotaState } from "../types.js";
 import { getAgentProfilesDir, getRealHome } from "../core/paths.js";
 import { isQuotaError } from "../core/supervisor.js";
 import { loadConfig } from "../core/config.js";
+import {
+  DEFAULT_POOL,
+  FREE_POOL,
+  innerProviderOf,
+  loadDiscoveredInners,
+  parseModelRequest,
+  pickModelForPool,
+  poolForModelRequest,
+  saveDiscoveredInners
+} from "../core/pools.js";
 
 export class OpenCodeAdapter implements ProviderAdapter {
   id = "opencode";
@@ -28,21 +38,28 @@ export class OpenCodeAdapter implements ProviderAdapter {
     return getAgentProfilesDir(this.id);
   }
 
-  resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string {
-    // OpenCode models are typically provider/model (e.g. unsloth/model, anthropic/claude, openai/gpt)
-    let model = "";
-    let prev = "";
-    for (const a of args) {
-      if (prev === "--model" || prev === "-m") {
-        model = a;
-        break;
+  /** Inner providers seen in model catalogs (dynamic pool discovery). */
+  private innerProviders = new Set<string>(loadDiscoveredInners("opencode"));
+  /** Last fetched `provider/model` catalog for sync pool→model mapping. */
+  private modelCache: string[] = [];
+
+  private noteModels(models: string[]): void {
+    this.modelCache = models;
+    let changed = false;
+    for (const m of models) {
+      const inner = innerProviderOf(m);
+      if (inner && !this.innerProviders.has(inner)) {
+        this.innerProviders.add(inner);
+        changed = true;
       }
-      prev = a;
     }
-    if (model.includes("/")) {
-      return model.split("/")[0];
-    }
-    return "default";
+    if (changed) saveDiscoveredInners("opencode", [...this.innerProviders]);
+  }
+
+  resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string {
+    // OpenCode models are typically provider/model (e.g. opencode-go/model,
+    // unsloth-custom/model); free-suffixed models map to `{inner}-free`.
+    return poolForModelRequest(parseModelRequest(args));
   }
 
   getSharedPaths(): string[] {
@@ -53,7 +70,24 @@ export class OpenCodeAdapter implements ProviderAdapter {
   }
 
   getSupportedPools(): string[] {
-    return ["default"];
+    const inners = [...this.innerProviders].sort();
+    return [
+      DEFAULT_POOL,
+      FREE_POOL,
+      ...inners.flatMap((p) => [p, `${p}-free`])
+    ];
+  }
+
+  async discoverPools(profile?: string): Promise<string[]> {
+    this.noteModels(await this.listModels(profile));
+    return this.getSupportedPools();
+  }
+
+  getPoolModel(pool: string): string | undefined {
+    return (
+      pickModelForPool(this.modelCache, pool) ??
+      (pool === FREE_POOL ? "opencode/nemotron-3-ultra-free" : undefined)
+    );
   }
 
   prepareExecution(
@@ -151,7 +185,7 @@ export class OpenCodeAdapter implements ProviderAdapter {
   async getQuotaStatus(profile: string): Promise<PoolQuota[]> {
     // Quota state is tracked deterministically via live turn supervision
     // and persisted cooldowns in ~/.agent-mux/state/cooldowns.json, eliminating disk log pollution.
-    return [{ pool: "default", state: "READY" }];
+    return this.getSupportedPools().map((pool) => ({ pool, state: "READY" as const }));
   }
 
   async listModels(profile = "primary"): Promise<string[]> {
@@ -171,10 +205,12 @@ export class OpenCodeAdapter implements ProviderAdapter {
       });
 
       if (child.stdout) {
-        return child.stdout
+        const models = child.stdout
           .split("\n")
           .map((m) => m.trim())
           .filter(Boolean);
+        this.noteModels(models);
+        return models;
       }
     } catch {}
     return [];
@@ -250,7 +286,26 @@ export class OpenCodeAdapter implements ProviderAdapter {
       });
 
       if (child.status === 0 && child.stdout && child.stdout.trim().length > 0) {
-        const modelCount = child.stdout.split("\n").filter(Boolean).length;
+        const models = child.stdout.split("\n").map((m) => m.trim()).filter(Boolean);
+        this.noteModels(models);
+        if (pool !== DEFAULT_POOL) {
+          const match = pickModelForPool(models, pool);
+          if (!match) {
+            return { state: "LIMIT", details: `No models available for pool '${pool}'` };
+          }
+          if (pool === FREE_POOL) {
+            const freeCount = models.filter((m) => pickModelForPool([m], pool) === m).length;
+            return {
+              state: "READY",
+              details: `Authenticated (${freeCount} free models available; configure opencode_probe_model for inference probe)`
+            };
+          }
+          return {
+            state: "READY",
+            details: `Authenticated (pool '${pool}' resolves to ${match}; configure opencode_probe_model for inference probe)`
+          };
+        }
+        const modelCount = models.length;
         return {
           state: "READY",
           details: `Authenticated (${modelCount} CLI models available; configure opencode_probe_model for inference probe)`

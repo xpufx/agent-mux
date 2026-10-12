@@ -1,8 +1,9 @@
-import { getProviderAdapter, listSupportedProviders, AGY_NON_PROMPT_SUBCOMMANDS } from "../providers/index.js";
+import { getProviderAdapter, listSupportedProviders, AGY_NON_PROMPT_SUBCOMMANDS, PI_NON_PROMPT_SUBCOMMANDS } from "../providers/index.js";
 import { getProviderStatus, listProfiles } from "../core/profiles.js";
 import { selectProfile, applyPoolModel } from "../core/router.js";
 import { runSupervisor, parseResetDurationSeconds } from "../core/supervisor.js";
-import { recordCooldown, clearCooldown } from "../core/state.js";
+import { clearCooldown } from "../core/state.js";
+import { recordCooldownFamily } from "../core/pools.js";
 import { spawn } from "node:child_process";
 
 import {
@@ -65,7 +66,7 @@ async function runProbe(providerId: string, profile?: string, pool?: string) {
           clearCooldown(prov.id, prof, pl);
         } else if (res.state === "LIMIT") {
           const durSec = parseResetDurationSeconds(res.details);
-          recordCooldown(prov.id, prof, pl, durSec, res.details);
+          recordCooldownFamily(prov.id, prof, pl, durSec, res.details);
         }
       }
     } else {
@@ -77,8 +78,10 @@ async function runProbe(providerId: string, profile?: string, pool?: string) {
 async function executeProvider(providerId: string, rawArgs: string[]) {
   const adapter = getProviderAdapter(providerId);
 
-  // Parse routing flags
+  // Parse routing flags (--profile/--round-robin/--pool are mux flags,
+  // never passed to the underlying CLI).
   let mode = "auto";
+  let poolOverride: string | undefined;
   const cmdArgs: string[] = [];
   let isStreamJson = false;
 
@@ -88,6 +91,8 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
       mode = rawArgs[++i];
     } else if (arg === "--round-robin" || arg === "--rr") {
       mode = "round-robin";
+    } else if (arg === "--pool" && i + 1 < rawArgs.length) {
+      poolOverride = rawArgs[++i];
     } else {
       if (arg === "stream-json") isStreamJson = true;
       cmdArgs.push(arg);
@@ -99,15 +104,20 @@ async function executeProvider(providerId: string, rawArgs: string[]) {
     adapter.id === "antigravity" &&
     subCmd !== undefined &&
     AGY_NON_PROMPT_SUBCOMMANDS.has(subCmd);
+  const isPiSubcommand =
+    adapter.id === "pi" &&
+    subCmd !== undefined &&
+    PI_NON_PROMPT_SUBCOMMANDS.has(subCmd);
 
-  const decision = await selectProfile(adapter, cmdArgs, process.env, mode);
-  const execArgs = isAgySubcommand ? [...cmdArgs] : applyPoolModel(adapter, cmdArgs, decision.pool);
+  const decision = await selectProfile(adapter, cmdArgs, process.env, mode, [], undefined, poolOverride);
+  const execArgs = isAgySubcommand || isPiSubcommand ? [...cmdArgs] : applyPoolModel(adapter, cmdArgs, decision.pool);
 
   if (isStreamJson) {
     const code = await runSupervisor({
       adapter,
       initialProfile: decision.profile,
       initialPool: decision.pool,
+      poolOverride,
       binaryPath: adapter.defaultBinaryPath,
       args: cmdArgs
     });
@@ -170,10 +180,12 @@ Usage:
 Providers:
   antigravity, agy                            Google Antigravity CLI
   opencode                                    OpenCode CLI
+  pi                                          Pi coding agent CLI
 
 Options:
   --profile <name>                            Explicitly select profile (overrides auto-routing)
   --round-robin, --rr                         Alternate healthy accounts sequentially
+  --pool <name>                               Request a specific quota pool (e.g. free)
   --help, -h                                  Show this help message
 
 Examples:
@@ -271,7 +283,7 @@ Actions:
     console.log(`\x1b[36m[*] Launching interactive authentication for ${adapter.displayName} (profile: ${profName})...\x1b[0m`);
     console.log(`    HOME=${profDir}`);
 
-    const child = spawn(adapter.defaultBinaryPath, ["auth"], {
+    const child = spawn(adapter.defaultBinaryPath, adapter.authArgs ?? ["auth"], {
       stdio: "inherit",
       env: {
         ...process.env,

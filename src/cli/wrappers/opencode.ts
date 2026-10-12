@@ -17,8 +17,10 @@ async function main() {
     return;
   }
 
-  // Parse routing flags
+  // Parse routing flags (--profile/--round-robin/--pool are wrapper flags,
+  // never passed to the underlying CLI).
   let mode = "auto";
+  let poolOverride: string | undefined;
   const cmdArgs: string[] = [];
   let isStream = false;
 
@@ -28,13 +30,15 @@ async function main() {
       mode = rawArgs[++i];
     } else if (arg === "--round-robin" || arg === "--rr") {
       mode = "round-robin";
+    } else if (arg === "--pool" && i + 1 < rawArgs.length) {
+      poolOverride = rawArgs[++i];
     } else {
       if (arg === "acp" || arg === "serve" || arg === "stream-json") isStream = true;
       cmdArgs.push(arg);
     }
   }
 
-  const decision = await selectProfile(adapter, cmdArgs, process.env, mode);
+  const decision = await selectProfile(adapter, cmdArgs, process.env, mode, [], undefined, poolOverride);
   const execArgs = applyPoolModel(adapter, cmdArgs, decision.pool);
 
   if (isStream) {
@@ -42,6 +46,7 @@ async function main() {
       adapter,
       initialProfile: decision.profile,
       initialPool: decision.pool,
+      poolOverride,
       binaryPath: adapter.defaultBinaryPath,
       args: cmdArgs
     });
