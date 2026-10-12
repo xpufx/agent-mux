@@ -187,6 +187,43 @@ test("executeProvider - handles --mux-version with exit 0", async () => {
   }
 });
 
+test("executeProvider - handles --is-mux with exit 0", async () => {
+  const adapter = {
+    id: "agy",
+    displayName: "Antigravity",
+    binaryName: "agy",
+    defaultBinaryPath: "/bin/true",
+    profilesBaseDir: "/tmp",
+    getAuthStatus: async () => true,
+    getQuotaStatus: async () => [],
+    resolveTargetPool: () => "default",
+    getSupportedPools: () => ["default"],
+    getSharedPaths: () => []
+  };
+  const code = await executeProvider(adapter, ["--is-mux"]);
+  assert.equal(code, 0);
+});
+
+test("executeProvider - bypasses multiplexer with --native, --upstream, --orig, or --passthrough", async () => {
+  const adapter = {
+    id: "agy",
+    displayName: "Antigravity",
+    binaryName: "agy",
+    defaultBinaryPath: "/bin/true",
+    profilesBaseDir: "/tmp",
+    getAuthStatus: async () => true,
+    getQuotaStatus: async () => [],
+    resolveTargetPool: () => "default",
+    getSupportedPools: () => ["default"],
+    getSharedPaths: () => []
+  };
+
+  for (const bypassFlag of ["--native", "--upstream", "--orig", "--passthrough"]) {
+    const code = await executeProvider(adapter, [bypassFlag, "--version"]);
+    assert.equal(code, 0, `Expected 0 exit code for bypass flag ${bypassFlag}`);
+  }
+});
+
 test("isBinaryWrapped - detects wrapper script vs native binary", async () => {
   const { isBinaryWrapped } = await import("../dist/index.js");
   const wrapperFile = path.join(tmpHome, "mock-wrapper");
@@ -200,4 +237,5 @@ test("isBinaryWrapped - detects wrapper script vs native binary", async () => {
   assert.equal(isBinaryWrapped(nativeFile), false);
   assert.equal(isBinaryWrapped("/nonexistent/file"), false);
 });
+
 

@@ -77,6 +77,13 @@ test("isQuotaError - supervised-turn failure vocabulary detected", () => {
   assert.equal(isQuotaError("insufficient quota to complete turn"), true);
   assert.equal(isQuotaError("Resource exhausted, please retry"), true);
   assert.equal(isQuotaError("429 Too Many Requests"), true);
+  assert.equal(
+    isQuotaError(
+      "[System Error] API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server"
+    ),
+    true
+  );
+  assert.equal(isQuotaError("HTTP 503 Service Unavailable"), true);
 });
 
 test("isQuotaError - structured engine payloads detected (no [object Object] collapse)", () => {
@@ -140,6 +147,10 @@ test("isProcessCrashQuotaError - legacy and broadened stderr shapes", () => {
   assert.equal(
     isProcessCrashQuotaError(["turn ok", "Rate limit exceeded on account"]),
     "Rate limit exceeded on account"
+  );
+  assert.equal(
+    isProcessCrashQuotaError(["[System Error] API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server"]),
+    "[System Error] API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server"
   );
   assert.equal(
     isProcessCrashQuotaError(["boot ok", "exit code 1", "connection reset"]),

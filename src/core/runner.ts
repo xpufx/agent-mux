@@ -37,9 +37,30 @@ export async function executeProvider(
       ? getProviderAdapter(providerIdOrAdapter)
       : providerIdOrAdapter;
 
+  if (rawArgs.includes("--is-mux")) {
+    return 0;
+  }
+
   if (rawArgs.includes("--mux-version")) {
     console.log(`agent-mux v${AGENT_MUX_VERSION} (wrapper: ${adapter.displayName} [${adapter.id}] -> ${adapter.defaultBinaryPath})`);
     return 0;
+  }
+
+  // Native bypass: invoke upstream binary directly without routing/supervisor
+  const isNativeBypass = rawArgs.some(
+    (a) => a === "--native" || a === "--upstream" || a === "--orig" || a === "--passthrough"
+  );
+  if (isNativeBypass) {
+    const nativeArgs = rawArgs.filter(
+      (a) => a !== "--native" && a !== "--upstream" && a !== "--orig" && a !== "--passthrough"
+    );
+    return new Promise<number>((resolve) => {
+      const child = spawn(adapter.defaultBinaryPath, nativeArgs, {
+        stdio: "inherit",
+        env
+      });
+      child.on("close", (code) => resolve(code ?? 0));
+    });
   }
 
   // Bypass router if already executing within an isolated profile

@@ -86,7 +86,10 @@ export function isQuotaError(text: unknown): boolean {
     t.includes("too many requests") ||
     t.includes("code 429") ||
     t.includes("status 429") ||
-    t.includes("http 429")
+    t.includes("http 429") ||
+    t.includes("no capacity available") ||
+    t.includes("capacity available for model") ||
+    (t.includes("503") && (t.includes("unavailable") || t.includes("capacity")))
   );
 }
 
