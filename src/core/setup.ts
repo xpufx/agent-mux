@@ -179,7 +179,9 @@ function resolveAccounts(agentMuxHome: string, explicit?: string[]): string[] {
     });
     if (found.length > 0) return found;
   }
-  return ["primary", "secondary"];
+  throw new Error(
+    `No existing accounts found under ${agyProfiles} and none specified. Please provide accounts explicitly.`
+  );
 }
 
 function planDotfileLinks(ctx: PlanContext, realHome: string, profileDir: string): void {

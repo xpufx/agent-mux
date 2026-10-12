@@ -48,6 +48,7 @@ function opts(sb, extra = {}) {
     localBin: sb.localBin,
     distDir: sb.distDir,
     pathEnv: sb.pathEnv,
+    accounts: ["primary", "secondary"],
     ...extra
   };
 }
@@ -270,3 +271,12 @@ test("planSetup honors provider and account filters", () => {
   );
   assert.ok(!plan.some((a) => a.target.includes(path.join("profiles", "antigravity"))));
 });
+
+test("planSetup throws clear error when no accounts exist on disk and none specified", () => {
+  const sb = makeSandbox();
+  assert.throws(
+    () => planSetup(opts(sb, { accounts: [] })),
+    /No existing accounts found under .* and none specified/
+  );
+});
+

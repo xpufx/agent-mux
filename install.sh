@@ -33,7 +33,9 @@ if [[ ${#ACCOUNTS[@]} -eq 0 ]]; then
 		mapfile -t ACCOUNTS < <(ls -1 "$AGY_PROFILES" 2>/dev/null || true)
 	fi
 	if [[ ${#ACCOUNTS[@]} -eq 0 ]]; then
-		ACCOUNTS=("primary" "secondary")
+		echo "Error: No existing accounts found under $AGY_PROFILES and none specified." >&2
+		echo "Usage: ./install.sh [provider|all] <account1> [account2...]" >&2
+		exit 1
 	fi
 fi
 
