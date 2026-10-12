@@ -77,10 +77,14 @@ export function recordCooldownFamily(
   durationSec: number,
   reason?: string
 ): void {
+  if (durationSec <= 0) {
+    return;
+  }
   for (const p of poolFamily(pool)) {
     recordCooldown(provider, profile, p, durationSec, reason);
   }
 }
+
 
 /**
  * Pick a representative model id for a pool from a `provider/model` catalog.
