@@ -109,6 +109,7 @@ export class AntigravityAdapter implements ProviderAdapter {
   id = "antigravity";
   displayName = "Google Antigravity";
   binaryName = "agy";
+  authArgs = [];
 
   get defaultBinaryPath(): string {
     const realHome = getRealHome();

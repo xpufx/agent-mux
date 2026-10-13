@@ -134,6 +134,22 @@ test("buildAuthInvocation delegates to provider prepareExecution when available"
   assert.deepEqual(seen, { profile: "primary", args: ["auth"], mode: "scoped" });
 });
 
+test("buildAuthInvocation respects adapter authArgs (antigravity uses empty args)", async () => {
+  const { AntigravityAdapter } = await import("../dist/index.js");
+  const agy = new AntigravityAdapter();
+  assert.deepEqual(agy.authArgs, []);
+
+  let capturedArgs = null;
+  agy.prepareExecution = (profile, args) => {
+    capturedArgs = args;
+    return { binary: "/custom/agy", args, env: {} };
+  };
+
+  const invocation = buildAuthInvocation(agy, "test-user");
+  assert.deepEqual(capturedArgs, []);
+  assert.deepEqual(invocation.args, []);
+});
+
 test("authenticateProfile runs the isolated auth invocation", async () => {
   const adapter = makeAdapter("eta");
   const calls = [];
