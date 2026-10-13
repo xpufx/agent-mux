@@ -65,12 +65,31 @@ export function replaceModelArg(args: string[], model: string): string[] {
   return out;
 }
 
-/** Rewrite the model argument when a policy selects a pool different from the requested one. */
+/** True when CLI args already carry an explicit `--model` / `-m` request. */
+export function hasExplicitModelArg(args: string[]): boolean {
+  for (const a of args) {
+    if (a === "--model" || a === "-m" || a.startsWith("--model=")) return true;
+  }
+  return false;
+}
+
+/**
+ * Rewrite the model argument when a policy selects a pool different from the requested one.
+ *
+ * An explicitly supplied `--model` is preserved when no pool change is required
+ * (selected pool matches the requested/target pool): clobbering it with the
+ * pool default would discard the caller's exact model choice. A pool change
+ * (spillover/failover) still rewrites the model to the new pool's default.
+ */
 export function applyPoolModel(
   adapter: ProviderAdapter,
   args: string[],
-  pool: string
+  pool: string,
+  targetPool?: string
 ): string[] {
+  if (hasExplicitModelArg(args) && (targetPool === undefined || pool === targetPool)) {
+    return [...args];
+  }
   const model = adapter.getPoolModel?.(pool);
   if (!model) return [...args];
   return replaceModelArg(args, model);

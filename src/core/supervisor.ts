@@ -11,7 +11,7 @@ import {
 } from "./config.js";
 import { logMuxMessage } from "./state.js";
 import { recordCooldownFamily } from "./pools.js";
-import { selectProfile, candidateKey, applyPoolModel } from "./router.js";
+import { selectProfile, candidateKey, applyPoolModel, hasExplicitModelArg } from "./router.js";
 import { parseResetDurationSeconds, isCapacityError } from "./cooldown.js";
 
 export { parseResetDurationSeconds, isCapacityError } from "./cooldown.js";
@@ -197,7 +197,14 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   // The requested pool stays fixed for the whole session so the policy candidate
   // matrix is always built against the original request, not the current fallback.
   let currentPool = options.initialPool || targetPool;
-  let currentArgs = currentPool !== targetPool ? applyPoolModel(adapter, args, currentPool) : [...args];
+  // Preserve an explicit `--model` when no pool change is required; only
+  // rewrite to the pool default on spillover/failover or when `--pool` was
+  // given without a model.
+  let currentArgs = currentPool !== targetPool
+    ? applyPoolModel(adapter, args, currentPool, targetPool)
+    : hasExplicitModelArg(args)
+      ? [...args]
+      : applyPoolModel(adapter, args, currentPool, targetPool);
   let conversationId: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
@@ -544,8 +551,11 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       triedCandidates.add(candidateKey(nextProf, nextPool));
 
       // Only rewrite the model when the policy spills over into a different pool.
+      // Returning to the originally requested pool restores the caller's args
+      // (preserving an explicit --model); moving to a new pool applies that
+      // pool's default model.
       if (nextPool !== currentPool) {
-        currentArgs = nextPool === targetPool ? [...args] : applyPoolModel(adapter, args, nextPool);
+        currentArgs = applyPoolModel(adapter, args, nextPool, targetPool);
       }
 
       const appliedModel = adapter.getPoolModel?.(nextPool);

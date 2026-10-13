@@ -1,5 +1,5 @@
 import { getProviderAdapter } from "../providers/index.js";
-import { selectProfile, applyPoolModel } from "./router.js";
+import { selectProfile, applyPoolModel, hasExplicitModelArg } from "./router.js";
 import { runSupervisor } from "./supervisor.js";
 import { getIsolationMode } from "./config.js";
 import { parseArgs, type MuxFlags } from "./args.js";
@@ -109,7 +109,11 @@ export async function executeProvider(
   const decision = await selectProfile(adapter, cmdArgs, env, mode, [], undefined, poolOverride);
   const execArgs = isSubcommand || isInfoOnly
     ? [...cmdArgs]
-    : applyPoolModel(adapter, cmdArgs, decision.pool);
+    : decision.pool !== decision.targetPool
+      ? applyPoolModel(adapter, cmdArgs, decision.pool, decision.targetPool)
+      : hasExplicitModelArg(cmdArgs)
+        ? [...cmdArgs]
+        : applyPoolModel(adapter, cmdArgs, decision.pool, decision.targetPool);
 
   const isStream = adapter.isStreamCommand
     ? adapter.isStreamCommand(cmdArgs)
