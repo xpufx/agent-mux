@@ -51,7 +51,7 @@ Clients (Paseo, Terminal, Automation)
         │     │     2. Queries router for healthy fallback candidate
         │     │     3. If all candidates exhausted: HALTS immediately (no flapping)
         │     │     4. If healthy candidate exists: switches profile & replays turn
-        │     │        (swaps the scoped auth bind; swaps HOME only in `home` mode)
+        │     │        (swaps the scoped auth bind via bwrap / XDG)
         │     ▼
         ▼
    Shared Trajectory Store (~/.gemini/.../conversations/*.db, ~/.local/share/opencode)
@@ -68,10 +68,13 @@ Clients (Paseo, Terminal, Automation)
 │   └── cooldowns.json                  # Active quota cooldowns with expiry timestamps
 ├── profiles/
 │   ├── antigravity/
-│   │   ├── primary/                    # Isolated $HOME for Account 1
-│   │   ├── secondary/                  # Isolated $HOME for Account 2
-│   │   └── tertiary/                   # Isolated $HOME for Account 3
-│   └── opencode/
+│   │   ├── primary/                    # Scoped auth credentials for Account 1
+│   │   ├── secondary/                  # Scoped auth credentials for Account 2
+│   │   └── tertiary/                   # Scoped auth credentials for Account 3
+│   ├── opencode/
+│   │   ├── primary/
+│   │   └── secondary/
+│   └── pi/
 │       ├── primary/
 │       └── secondary/
 └── .rr_<provider>_<pool>               # Round-robin state tracking
@@ -101,7 +104,7 @@ agent-mux setup
 
 `agent-mux setup` is idempotent and safe to re-run. It detects the real provider
 binaries (`agy.bin`, `opencode.bin`), creates the isolated profile trees under
-`~/.agent-mux/profiles/`, links shared developer dotfiles and session history,
+`~/.agent-mux/profiles/`, seeds provider credentials and session history,
 and wires the `agent-mux`, `agy`, `opencode`, and `opencode-mux` wrappers into
 `~/.local/bin` (make sure it is ahead of the provider binaries on `$PATH`).
 
@@ -137,7 +140,7 @@ This will:
 - Build standalone TypeScript binaries into `dist/` with ESBuild.
 - Move the native `agy` binary to `~/.local/bin/agy.bin`.
 - Install `agent-mux` and transparent wrappers (`agy`, `opencode-mux`) into `~/.local/bin/`.
-- Configure isolated profile trees under `~/.agent-mux/profiles/` with symlinked conversation history and shared dotfiles.
+- Configure profile directories under `~/.agent-mux/profiles/` with seeded credentials and shared session history.
 
 ### 2. Inspect Quota & Auth Status
 
@@ -147,7 +150,7 @@ agent-mux status
 
 Output:
 ```text
-=== agent-mux Provider & Profile Status [Isolation Mode: scoped] ===
+=== agent-mux Provider & Profile Status ===
 
 Provider: Google Antigravity (antigravity)
   • primary [Authenticated] (primary@example.com):
@@ -239,7 +242,7 @@ agent-mux profile list
 
 Output:
 ```text
-=== Configured Account Profiles [Isolation Mode: scoped] ===
+=== Configured Account Profiles ===
 
 Provider: Google Antigravity (antigravity)
 Base directory: ~/.agent-mux/profiles/antigravity
@@ -253,7 +256,7 @@ Base directory: ~/.agent-mux/profiles/opencode
 ```
 
 ```bash
-# Scaffold a new account profile (symlinks dotfiles and trajectories)
+# Create a new account profile directory
 agent-mux profile add antigravity tertiary
 
 # Interactively log in to an account profile
