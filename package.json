@@ -20,6 +20,7 @@
   },
   "scripts": {
     "build": "node esbuild.config.mjs",
+    "pretest": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "node --test"
   },

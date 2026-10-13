@@ -113,21 +113,7 @@ test("scoped prepareExecution fails fast with actionable diagnostic when bwrap i
   );
 });
 
-test("getIsolationMode resolves scoped by default, config opt-in, and env override", () => {
-  const configPath = path.join(muxHome, "config.json");
-  fs.rmSync(configPath, { force: true });
-  delete process.env.AGENT_MUX_ISOLATION_MODE;
-
-  assert.equal(getIsolationMode(), "scoped");
-
-  fs.writeFileSync(configPath, JSON.stringify({ isolation_mode: "home" }));
-  assert.equal(getIsolationMode(), "home");
-
-  process.env.AGENT_MUX_ISOLATION_MODE = "scoped";
-  assert.equal(getIsolationMode(), "scoped");
-
-  delete process.env.AGENT_MUX_ISOLATION_MODE;
-  fs.rmSync(configPath, { force: true });
+test("getIsolationMode always returns scoped", () => {
   assert.equal(getIsolationMode(), "scoped");
 });
 

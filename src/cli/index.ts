@@ -25,7 +25,6 @@ import {
   getSurfaceAccountMode,
   parseSurfaceAccountMode,
   getIsolationMode,
-  parseIsolationMode,
   getRoutingPolicy,
   parseRoutingPolicy,
   getConfigFilePath
@@ -480,7 +479,6 @@ async function main() {
     if (sub === "list") {
       const cfg = loadConfig();
       const activeSurface = getSurfaceAccountMode();
-      const activeIsolation = getIsolationMode();
       const activeRoutingPolicy = getRoutingPolicy();
       console.log("=== agent-mux Configuration ===");
       console.log(`Config file: ${getConfigFilePath()}`);
@@ -488,13 +486,6 @@ async function main() {
         `Active surface_account: ${activeSurface}${
           process.env.AGENT_MUX_SURFACE_ACCOUNT
             ? " (overridden by AGENT_MUX_SURFACE_ACCOUNT env)"
-            : ""
-        }`
-      );
-      console.log(
-        `Active isolation_mode:  ${activeIsolation}${
-          process.env.AGENT_MUX_ISOLATION_MODE
-            ? " (overridden by AGENT_MUX_ISOLATION_MODE env)"
             : ""
         }`
       );
@@ -518,8 +509,6 @@ async function main() {
       }
       if (key === "surface_account") {
         console.log(getSurfaceAccountMode());
-      } else if (key === "isolation_mode") {
-        console.log(getIsolationMode());
       } else if (key === "routingPolicy" || key === "routing_policy") {
         console.log(getRoutingPolicy());
       } else {
@@ -546,15 +535,6 @@ async function main() {
           process.exit(1);
         }
         cfg.surface_account = parsed;
-      } else if (key === "isolation_mode") {
-        const parsed = parseIsolationMode(val);
-        if (!parsed) {
-          console.error(
-            `Invalid isolation_mode: '${val}'. Valid options: scoped (real HOME with scoped configs), home (independent HOME per profile)`
-          );
-          process.exit(1);
-        }
-        cfg.isolation_mode = parsed;
       } else if (key === "routingPolicy" || key === "routing_policy") {
         const parsed = parseRoutingPolicy(val);
         if (!parsed) {

@@ -4,12 +4,11 @@ import { getAgentMuxHome } from "./paths.js";
 import type { ProfileRecord } from "./profiles.js";
 
 export type SurfaceAccountMode = "tool" | "message" | "both" | "none";
-export type IsolationMode = "scoped" | "home";
+export type IsolationMode = "scoped";
 export type RoutingPolicy = "pool-strict" | "pool-spillover" | "account-first";
 
 export interface AgentMuxConfig {
   surface_account?: SurfaceAccountMode;
-  isolation_mode?: IsolationMode;
   routingPolicy?: RoutingPolicy;
   /** Registry of profiles created through the CLI (directory presence is still authoritative). */
   profiles?: ProfileRecord[];
@@ -102,32 +101,6 @@ export function getRoutingPolicy(): RoutingPolicy {
   return "pool-strict";
 }
 
-export function parseIsolationMode(val: unknown): IsolationMode | undefined {
-  if (typeof val !== "string") return undefined;
-  const s = val.toLowerCase().trim();
-  if (s === "scoped" || s === "shared" || s === "bwrap" || s === "mount") {
-    return "scoped";
-  }
-  if (s === "home" || s === "profile-home" || s === "isolated-home" || s === "isolated") {
-    return "home";
-  }
-  return undefined;
-}
-
 export function getIsolationMode(): IsolationMode {
-  // 1. Environment variable override
-  if (process.env.AGENT_MUX_ISOLATION_MODE !== undefined) {
-    const parsed = parseIsolationMode(process.env.AGENT_MUX_ISOLATION_MODE);
-    if (parsed) return parsed;
-  }
-
-  // 2. Persistent config file
-  const config = loadConfig();
-  if (config.isolation_mode) {
-    const parsed = parseIsolationMode(config.isolation_mode);
-    if (parsed) return parsed;
-  }
-
-  // 3. Default to "scoped" (real $HOME with per-profile auth; bwrap/XDG isolation)
   return "scoped";
 }
