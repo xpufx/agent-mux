@@ -69,7 +69,7 @@ test("planSetup plans profile trees, dotfile links and wrappers without writing"
     )
   );
   assert.ok(
-    plan.some(
+    !plan.some(
       (a) => a.kind === "symlink" && a.target === path.join(agyPrimary, ".gitconfig")
     )
   );
@@ -137,7 +137,7 @@ test("runSetup applies the plan and is idempotent", () => {
     "opencode"
   );
   const agySecondary = path.join(sb.agentMuxHome, "profiles", "antigravity", "secondary");
-  assert.ok(fs.lstatSync(path.join(agyPrimary, ".gitconfig")).isSymbolicLink());
+  assert.equal(fs.existsSync(path.join(agyPrimary, ".gitconfig")), false);
   assert.ok(fs.lstatSync(path.join(agyPrimary, ".gemini")).isDirectory());
   assert.ok(!fs.lstatSync(path.join(agyPrimary, ".gemini")).isSymbolicLink());
   assert.ok(fs.lstatSync(path.join(agyPrimary, ".gemini", "config")).isSymbolicLink());
@@ -183,7 +183,7 @@ test("runSetup applies the plan and is idempotent", () => {
     second.some(
       (a) =>
         a.kind === "skip" &&
-        a.target === path.join(agyPrimary, ".gitconfig") &&
+        a.target === path.join(agyPrimary, ".gemini", "config") &&
         a.reason.startsWith("already linked")
     )
   );
@@ -277,6 +277,22 @@ test("planSetup throws clear error when no accounts exist on disk and none speci
   assert.throws(
     () => planSetup(opts(sb, { accounts: [] })),
     /No existing accounts found under .* and none specified/
+  );
+});
+
+test("runSetup fails fast when invoked inside a sandboxed session", () => {
+  const sb = makeSandbox();
+  assert.throws(
+    () =>
+      runSetup(
+        opts(sb, {
+          sandboxDetection: {
+            env: { AGENT_MUX_ACTIVE_PROFILE: "primary" },
+            readFile: () => ""
+          }
+        })
+      ),
+    /Detected active sandboxed session; profile management must be run from the host environment/
   );
 });
 

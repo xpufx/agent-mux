@@ -108,20 +108,9 @@ test("scoped prepareExecution fails fast with actionable diagnostic when bwrap i
       assert.ok(err.message.includes("apt install bubblewrap"));
       assert.ok(err.message.includes("pacman -S bubblewrap"));
       assert.ok(err.message.includes("dnf install bubblewrap"));
-      assert.ok(err.message.includes("config set isolation_mode home"));
       return true;
     }
   );
-});
-
-test("home mode is unchanged: profile dir becomes HOME and no bwrap involved", () => {
-  const profDir = makeProfile("alpha", "ALPHA-TOKEN\n");
-  const target = adapter.prepareExecution("alpha", ["-p", "hi"], { PATH: fakeBin }, "home");
-
-  assert.equal(target.binary, adapter.defaultBinaryPath);
-  assert.deepEqual(target.args, ["-p", "hi"]);
-  assert.equal(target.env.HOME, profDir);
-  assert.equal(target.env.REAL_HOME, realHome);
 });
 
 test("getIsolationMode resolves scoped by default, config opt-in, and env override", () => {

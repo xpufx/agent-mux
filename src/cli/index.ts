@@ -156,14 +156,8 @@ Examples:
   agent-mux setup                             Configure profiles and transparent wrappers
   agent-mux cooldowns                         View active rate-limit locks and countdowns
 
-Isolation Modes (agent-mux config set isolation_mode <home|scoped>):
-  home                                        (Default) Each profile acts as an independent $HOME.
-  scoped                                      $HOME and cwd remain user's real home; configs/tokens
-                                              are scoped per profile (concurrent-safe via bwrap/XDG).
-
 Environment Variables:
   AGENT_MUX_HOME                              Custom base dir (default: ~/.agent-mux)
-  AGENT_MUX_ISOLATION_MODE                    Override isolation mode (home or scoped)
   AGENT_MUX_SURFACE_ACCOUNT                   Stream notification mode (none, tool, message, both)
   AGENT_MUX_ROUTING_POLICY                    Failover order (pool-strict, pool-spillover, account-first)
   AGENT_MUX_PROFILE                           Force profile for execution

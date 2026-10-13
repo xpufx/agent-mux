@@ -170,61 +170,48 @@ export class PiAdapter implements ProviderAdapter {
     profile: string,
     args: string[],
     baseEnv: NodeJS.ProcessEnv,
-    isolationMode: string
+    _isolationMode?: string
   ): { binary: string; args: string[]; env: NodeJS.ProcessEnv } {
     const profDir = path.join(this.profilesBaseDir, profile);
     const realHome = getRealHome();
 
-    if (isolationMode === "scoped") {
-      // In scoped mode HOME stays the real home, so only the login credential
-      // file is bind-mounted from the profile via bwrap (same pattern as agy).
-      // pi resolves config via homedir() with no XDG override.
-      const bwrapBin = findExecutableInPath("bwrap", baseEnv.PATH ?? process.env.PATH);
-      if (!bwrapBin) {
-        throw new Error(BWRAP_REQUIRED_MESSAGE);
-      }
-
-      const bwrapArgs = [
-        "--dev-bind", "/", "/",
-        "--tmpfs", "/run/user",
-        "--unsetenv", "DBUS_SESSION_BUS_ADDRESS"
-      ];
-      for (const relPath of PI_SCOPED_AUTH_PATHS) {
-        const src = path.join(profDir, relPath);
-        const dest = path.join(realHome, relPath);
-        fs.mkdirSync(path.dirname(src), { recursive: true });
-        fs.mkdirSync(path.dirname(dest), { recursive: true });
-        if (!fs.existsSync(src)) fs.writeFileSync(src, "");
-        bwrapArgs.push("--bind", src, dest);
-      }
-      const profilesDir = path.dirname(this.profilesBaseDir);
-      if (fs.existsSync(profilesDir)) {
-        bwrapArgs.push("--tmpfs", profilesDir);
-      }
-      bwrapArgs.push(this.defaultBinaryPath, ...args);
-
-      const cleanedEnv: NodeJS.ProcessEnv = {
-        ...baseEnv,
-        HOME: realHome,
-        REAL_HOME: realHome
-      };
-      delete cleanedEnv.DBUS_SESSION_BUS_ADDRESS;
-
-      return {
-        binary: bwrapBin,
-        args: bwrapArgs,
-        env: cleanedEnv
-      };
+    // Bubblewrap execution: HOME stays the real home, and only the login credential
+    // file is bind-mounted from the profile via bwrap (same pattern as agy).
+    const bwrapBin = findExecutableInPath("bwrap", baseEnv.PATH ?? process.env.PATH);
+    if (!bwrapBin) {
+      throw new Error(BWRAP_REQUIRED_MESSAGE);
     }
 
+    const bwrapArgs = [
+      "--dev-bind", "/", "/",
+      "--tmpfs", "/run/user",
+      "--unsetenv", "DBUS_SESSION_BUS_ADDRESS"
+    ];
+    for (const relPath of PI_SCOPED_AUTH_PATHS) {
+      const src = path.join(profDir, relPath);
+      const dest = path.join(realHome, relPath);
+      fs.mkdirSync(path.dirname(src), { recursive: true });
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      if (!fs.existsSync(src)) fs.writeFileSync(src, "");
+      bwrapArgs.push("--bind", src, dest);
+    }
+    const profilesDir = path.dirname(this.profilesBaseDir);
+    if (fs.existsSync(profilesDir)) {
+      bwrapArgs.push("--tmpfs", profilesDir);
+    }
+    bwrapArgs.push(this.defaultBinaryPath, ...args);
+
+    const cleanedEnv: NodeJS.ProcessEnv = {
+      ...baseEnv,
+      HOME: realHome,
+      REAL_HOME: realHome
+    };
+    delete cleanedEnv.DBUS_SESSION_BUS_ADDRESS;
+
     return {
-      binary: this.defaultBinaryPath,
-      args,
-      env: {
-        ...baseEnv,
-        HOME: profDir,
-        REAL_HOME: realHome
-      }
+      binary: bwrapBin,
+      args: bwrapArgs,
+      env: cleanedEnv
     };
   }
 

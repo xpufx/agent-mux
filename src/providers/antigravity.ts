@@ -33,14 +33,12 @@ export const AGY_NON_PROMPT_SUBCOMMANDS = new Set([
 ]);
 
 export const BWRAP_REQUIRED_MESSAGE =
-  "[agent-mux] Error: 'bwrap' (bubblewrap) is required for isolation_mode 'scoped', " +
+  "[agent-mux] Error: 'bwrap' (bubblewrap) is required for execution, " +
   "but was not found in PATH.\n" +
   "Please install bubblewrap using your system package manager:\n" +
   "  - Ubuntu / Debian: sudo apt install bubblewrap\n" +
   "  - Arch Linux:      sudo pacman -S bubblewrap\n" +
-  "  - Fedora / RHEL:   sudo dnf install bubblewrap\n" +
-  "Or configure agent-mux to use fallback mode:\n" +
-  "  agent-mux config set isolation_mode home";
+  "  - Fedora / RHEL:   sudo dnf install bubblewrap";
 
 export function findExecutableInPath(
   name: string,
@@ -175,54 +173,38 @@ export class AntigravityAdapter implements ProviderAdapter {
     profile: string,
     args: string[],
     baseEnv: NodeJS.ProcessEnv,
-    isolationMode: string
+    _isolationMode?: string
   ): { binary: string; args: string[]; env: NodeJS.ProcessEnv } {
     const profDir = path.join(this.profilesBaseDir, profile);
     const realHome = getRealHome();
 
-    if (isolationMode === "scoped") {
-      // In scoped mode: HOME and cwd remain the real user home. Only the
-      // profile's auth/credential files are bind-mounted over the real ones via
-      // bwrap, so concurrent profiles cannot read each other's login state
-      // while ~/.gemini conversations/config stay shared.
-      const bwrapBin = findExecutableInPath("bwrap", baseEnv.PATH ?? process.env.PATH);
-      if (!bwrapBin) {
-        throw new Error(BWRAP_REQUIRED_MESSAGE);
-      }
-
-      const cleanedEnv: NodeJS.ProcessEnv = {
-        ...baseEnv,
-        HOME: realHome,
-        REAL_HOME: realHome
-      };
-      delete cleanedEnv.DBUS_SESSION_BUS_ADDRESS;
-
-      const bwrapArgs = buildScopedBwrapArgs(
-        profDir,
-        realHome,
-        this.defaultBinaryPath,
-        args,
-        { muxProfilesDir: path.dirname(this.profilesBaseDir) }
-      );
-
-      return {
-        binary: bwrapBin,
-        args: bwrapArgs,
-        env: cleanedEnv
-      };
+    // Bubblewrap execution: HOME and cwd remain the real user home. Only the
+    // profile's auth/credential files are bind-mounted over the real ones via
+    // bwrap, so concurrent profiles cannot read each other's login state
+    // while ~/.gemini conversations/config stay shared.
+    const bwrapBin = findExecutableInPath("bwrap", baseEnv.PATH ?? process.env.PATH);
+    if (!bwrapBin) {
+      throw new Error(BWRAP_REQUIRED_MESSAGE);
     }
 
-    // Default "home" mode: profile acts as independent HOME directory
     const cleanedEnv: NodeJS.ProcessEnv = {
       ...baseEnv,
-      HOME: profDir,
+      HOME: realHome,
       REAL_HOME: realHome
     };
     delete cleanedEnv.DBUS_SESSION_BUS_ADDRESS;
 
-    return {
-      binary: this.defaultBinaryPath,
+    const bwrapArgs = buildScopedBwrapArgs(
+      profDir,
+      realHome,
+      this.defaultBinaryPath,
       args,
+      { muxProfilesDir: path.dirname(this.profilesBaseDir) }
+    );
+
+    return {
+      binary: bwrapBin,
+      args: bwrapArgs,
       env: cleanedEnv
     };
   }

@@ -30,14 +30,3 @@ export function getAgentLogsDir(): string {
 export function getAgentLogFilePath(): string {
   return path.join(getAgentLogsDir(), "agent-mux.log");
 }
-
-export const COMMON_DOTFILES = [
-  ".gitconfig",
-  ".git-credentials",
-  ".ssh",
-  ".local",
-  ".config",
-  ".bashrc",
-  ".profile",
-  ".agents"
-];

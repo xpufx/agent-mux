@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { getRealHome, getAgentMuxHome, COMMON_DOTFILES } from "./paths.js";
+import { getRealHome, getAgentMuxHome } from "./paths.js";
 import { checkCooldown, clearCooldown } from "./state.js";
 import { recordCooldownFamily } from "./pools.js";
 import { parseResetDurationSeconds } from "./cooldown.js";
@@ -126,17 +126,6 @@ export function ensureProfile(adapter: ProviderAdapter, profile: string): string
   const realHome = getRealHome();
   const profileDir = path.join(adapter.profilesBaseDir, profile);
   fs.mkdirSync(profileDir, { recursive: true });
-
-  // Symlink common developer dotfiles from real home
-  for (const dot of COMMON_DOTFILES) {
-    const src = path.join(realHome, dot);
-    const dest = path.join(profileDir, dot);
-    if (fs.existsSync(src) && !fs.existsSync(dest)) {
-      try {
-        fs.symlinkSync(src, dest);
-      } catch {}
-    }
-  }
 
   // Symlink shared provider storage if available
   const sharedPaths = adapter.getSharedPaths();

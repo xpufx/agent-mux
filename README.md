@@ -17,10 +17,10 @@ The included wrapper scripts (if you run install.sh) mean you do not need to cha
 Agent CLIs such as Google Antigravity (`agy`) and OpenCode enforce rolling token limits or rate limits per account. When driven by autonomous agent frameworks like Paseo, hitting a rate limit or HTTP 429 mid-turn terminates or stalls the agent session.
 
 `agent-mux` provides:
-1. **Environment Isolation**: By default (`isolation_mode: scoped`) each account keeps the real `$HOME` (`/home/<user>`) and only its auth/credential state is scoped per profile, so local configurations, caches, and state caches never conflict while agents still see the real host home. `isolation_mode: home` remains available as explicit opt-in for a fully isolated `$HOME` under `~/.agent-mux/profiles/<provider>/<account>`.
+1. **Environment Isolation**: Each account process keeps the real `$HOME` (`/home/<user>`) and `cwd`. Only provider-specific auth/credential state is scoped per profile via rootless `bwrap` (and XDG redirection), so local configurations, developer dotfiles (`.bashrc`, `.gitconfig`, `.ssh`), project caches, and trajectory databases never need brittle symlinks.
 2. **Configurable Base**: Defaults to `~/.agent-mux`, configurable via the `AGENT_MUX_HOME` environment variable.
 3. **Arbitrary $N$ Accounts**: Scale beyond 2 accounts to 3, 5, or more per provider with automatic sequential fallback and round-robin scheduling.
-4. **Shared Session History**: Trajectory databases (e.g. SQLite conversation stores) and developer dotfiles (`.gitconfig`, `.ssh`, `.agents`) are symlinked across profiles so project context is preserved.
+4. **Shared Session History & Tools**: Full access to your host repositories and tool chains while ensuring tokens stay strictly partitioned per profile.
 5. **Persistent Cooldown State**: Rate limits and quota exhaustion timestamps are tracked persistently in `~/.agent-mux/state/cooldowns.json` per `(provider, profile, pool)`. Accounts in cooldown are skipped immediately without attempting doomed turns.
 6. **Anti-Flapping Circuit Breaker**: If all accounts for a requested model/pool are exhausted, the supervisor halts immediately and surfaces the error upstream. It avoids mid-turn kills, duplicate prompt replay, or infinite flapping loops.
 7. **Quota Pool & Model Awareness**: Separates quota tracking by pool (e.g. Gemini vs Claude/Partner in Antigravity) so an exhausted Claude quota does not block Gemini tasks.
@@ -297,27 +297,17 @@ agent-mux config get surface_account
 agent-mux config set surface_account none
 ```
 
-### Isolation Modes (`isolation_mode`)
+### Execution & Environment Isolation
 
-Controls how account isolation and the agent process environment are handled:
+`agent-mux` guarantees that multiple profiles run concurrently without credential leakage, configuration collision, or fragile dotfile symlinks:
 
-- **`scoped`** (default): The agent process keeps the real user `$HOME` and `cwd` (`/home/<user>`). Only provider-specific auth/credential state is scoped per profile, so concurrent accounts never share a login while everything else (dotfiles, `~/.gemini` conversations/config, project caches) stays on the real host home:
-  - Antigravity uses a private Linux mount overlay via `bwrap` that bind-mounts **only** `~/.gemini/antigravity-cli/antigravity-oauth-token` from the profile. Real `~/.gemini` (conversations, `config`, caches) remains visible and is shared across profiles.
-  - Bubblewrap hardens the environment against ambient credential channels by mounting an empty `tmpfs` over `/run/user` and unsetting `DBUS_SESSION_BUS_ADDRESS`. This prevents `agy.bin`'s chained auth from falling back to the host desktop keyring (`org.freedesktop.secrets`).
+- **Preserved Host Environment**: The agent process keeps the real user `$HOME` and `cwd` (`/home/<user>`). Only provider-specific auth/credential state is scoped per profile, so concurrent accounts never share a login while everything else (dotfiles, `~/.gemini` conversations/config, project caches) stays on the real host home:
+  - Antigravity and Pi use a private Linux mount overlay via rootless `bwrap` that bind-mounts **only** the profile's credential files (`~/.gemini/antigravity-cli/antigravity-oauth-token` or `~/.pi/agent/auth.json`). Real configurations, extensions, and conversation histories remain visible on the real host home.
+  - Bubblewrap hardens the environment against ambient credential channels by mounting an empty `tmpfs` over `/run/user` and unsetting `DBUS_SESSION_BUS_ADDRESS`. This prevents provider binaries from falling back to the host desktop keyring (`org.freedesktop.secrets`).
   - Bubblewrap masks peer profile directories by mounting an empty `tmpfs` over `~/.agent-mux/profiles`, preventing unintentional token inspection across profiles.
-  - **Important**: The use of Bubblewrap here is strictly an **environment multiplexing and credential routing mechanism**, NOT a security boundary or containment sandbox. Processes inside `scoped` mode run with `--dev-bind / /` under your host user identity, retaining full read/write access to your system, tools, and repositories so coding agents can do their work. Do not treat `agent-mux` as a sandbox against untrusted code.
-  - OpenCode uses `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
-  - Both instances can run concurrently with real `$HOME` and real working directory.
-  - `bwrap` (bubblewrap) is required for Antigravity in this mode. If it is missing, `agent-mux` fails fast with install instructions for your distro; `install.sh` also warns during setup.
-- **`home`** (legacy opt-in): Each profile acts as an independent `$HOME` (`~/.agent-mux/profiles/<provider>/<profile>`). Fully isolated dotfiles, caches, and history per profile. Use this only when agents must not see the real host home. Note that `home` mode is targeted for deprecation once `scoped` soak verification completes (see Issue #34).
-
-```bash
-# Default: real HOME with per-profile auth (requires bwrap for agy)
-agent-mux config set isolation_mode scoped
-
-# Opt in to a fully isolated profile HOME
-agent-mux config set isolation_mode home
-```
+  - OpenCode uses standard `XDG_DATA_HOME` and `XDG_CONFIG_HOME` redirection.
+  - **Important**: The use of Bubblewrap here is strictly an **environment multiplexing and credential routing mechanism**, NOT a security boundary or containment sandbox. Processes run with `--dev-bind / /` under your host user identity, retaining full read/write access to your system, tools, and repositories so coding agents can do their work. Do not treat `agent-mux` as a sandbox against untrusted code.
+  - `bwrap` (bubblewrap) is required on Linux. If missing, `agent-mux` fails fast with package install instructions for your distribution.
 
 ### Failover Policy (`routingPolicy`)
 
@@ -353,7 +343,6 @@ AGENT_MUX_ROUTING_POLICY=pool-spillover agy -p "echo hi"
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `AGENT_MUX_HOME` | Custom base directory for profiles and state | `~/.agent-mux` |
-| `AGENT_MUX_ISOLATION_MODE` | Overrides `isolation_mode` (`scoped` or `home`) | Config file / `scoped` |
 | `AGENT_MUX_SURFACE_ACCOUNT` | Overrides `surface_account` mode (`none`, `tool`, `message`, `both`) | Config file / `none` |
 | `AGENT_MUX_ROUTING_POLICY` | Overrides `routingPolicy` (`pool-strict`, `pool-spillover`, `account-first`) | Config file / `pool-strict` |
 | `AGENT_MUX_PROFILE` | Forces execution to a specific account profile | Auto-routed |

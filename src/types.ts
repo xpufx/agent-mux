@@ -36,7 +36,7 @@ export interface ProviderAdapter {
     profile: string,
     args: string[],
     baseEnv: NodeJS.ProcessEnv,
-    isolationMode: IsolationMode
+    isolationMode?: IsolationMode
   ): { binary: string; args: string[]; env: NodeJS.ProcessEnv };
   probe?(profile: string, pool: string): Promise<{ state: QuotaState; details: string }>;
   listModels?(profile?: string): Promise<string[]>;

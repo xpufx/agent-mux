@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getRealHome, getAgentMuxHome, COMMON_DOTFILES } from "./paths.js";
-import { getIsolationMode } from "./config.js";
+import { getRealHome, getAgentMuxHome } from "./paths.js";
+import { assertHostEnvironment, type SandboxDetectionOptions } from "./profiles.js";
 
 export type SetupProvider = "all" | "antigravity" | "opencode" | "pi";
 
@@ -24,6 +24,7 @@ export interface SetupOptions {
   accounts?: string[];
   pathEnv?: string;
   log?: (line: string) => void;
+  sandboxDetection?: SandboxDetectionOptions;
 }
 
 interface PlanContext {
@@ -196,14 +197,6 @@ function resolveAccounts(agentMuxHome: string, explicit?: string[]): string[] {
   );
 }
 
-function planDotfileLinks(ctx: PlanContext, realHome: string, profileDir: string): void {
-  for (const dot of COMMON_DOTFILES) {
-    const src = path.join(realHome, dot);
-    if (!fs.existsSync(src)) continue;
-    planSymlink(ctx, src, path.join(profileDir, dot), `link shared ${dot}`);
-  }
-}
-
 interface ResolvedRoots {
   realHome: string;
   agentMuxHome: string;
@@ -279,8 +272,6 @@ function planAntigravity(ctx: PlanContext, roots: ResolvedRoots, accounts: strin
       path.join(cliDir, "conversations"),
       "share conversation history"
     );
-
-    planDotfileLinks(ctx, roots.realHome, profDir);
   }
 
   // Preserve a real (non-symlink) agy binary before wiring the wrapper.
@@ -343,7 +334,6 @@ function planOpenCode(ctx: PlanContext, roots: ResolvedRoots, accounts: string[]
   if (fs.existsSync(realDb)) {
     planSymlink(ctx, realDb, path.join(primaryData, "opencode.db"), "share opencode.db");
   }
-  planDotfileLinks(ctx, roots.realHome, primaryDir);
 
   // Remaining profiles: isolated auth, shared config & project stores.
   for (const prof of accounts.slice(1)) {
@@ -366,7 +356,6 @@ function planOpenCode(ctx: PlanContext, roots: ResolvedRoots, accounts: string[]
     if (fs.existsSync(realDb)) {
       planSymlink(ctx, realDb, path.join(profData, "opencode.db"), "share opencode.db");
     }
-    planDotfileLinks(ctx, roots.realHome, profDir);
   }
 
   // Preserve a real (non-symlink) opencode binary before wiring the wrapper.
@@ -481,7 +470,6 @@ function planPi(ctx: PlanContext, roots: ResolvedRoots, accounts: string[]): voi
   if (fs.existsSync(realExtensions)) {
     planSymlink(ctx, realExtensions, path.join(primaryAgentDir, "extensions"), "share extensions");
   }
-  planDotfileLinks(ctx, roots.realHome, primaryDir);
 
   // Remaining profiles: isolated auth, shared defaults.
   for (const prof of accounts.slice(1)) {
@@ -504,7 +492,6 @@ function planPi(ctx: PlanContext, roots: ResolvedRoots, accounts: string[]): voi
     if (fs.existsSync(realExtensions)) {
       planSymlink(ctx, realExtensions, path.join(profAgentDir, "extensions"), "share extensions");
     }
-    planDotfileLinks(ctx, roots.realHome, profDir);
   }
 
   // Preserve the real pi binary before wiring the wrapper. pi ships as a Node
@@ -628,27 +615,30 @@ function applyPlan(plan: SetupAction[], dryRun: boolean, log: (line: string) => 
  * disk is touched. Returns the computed plan for callers/tests to inspect.
  */
 export function runSetup(options: SetupOptions = {}): SetupAction[] {
-  const plan = planSetup(options);
-  const log = options.log ?? ((line: string) => console.log(line));
-  const dryRun = options.dryRun ?? false;
-
   const realHome = options.realHome ?? getRealHome();
   const agentMuxHome = options.agentMuxHome ?? getAgentMuxHome();
   const localBin = options.localBin ?? path.join(realHome, ".local", "bin");
+
+  assertHostEnvironment({
+    profilesDir: path.join(agentMuxHome, "profiles"),
+    ...options.sandboxDetection
+  });
+
+  const plan = planSetup(options);
+  const log = options.log ?? ((line: string) => console.log(line));
+  const dryRun = options.dryRun ?? false;
 
   log(`=== agent-mux setup${dryRun ? " (dry run)" : ""} ===`);
   log(`Base Directory : ${agentMuxHome}`);
   log(`Local Bin      : ${localBin}`);
   log("");
 
-  // Scoped isolation relies on bubblewrap; warn once here so bootstrap and the
-  // CLI share the same pre-flight instead of duplicating it in install.sh.
+  // Rootless bubblewrap is required for isolated provider execution.
   const pathEnv = options.pathEnv ?? process.env.PATH ?? "";
-  if (getIsolationMode() === "scoped" && !hasBwrapInPath(pathEnv)) {
+  if (!hasBwrapInPath(pathEnv)) {
     log("[!] WARNING: 'bwrap' (bubblewrap) was not found in PATH.");
-    log("    The default isolation_mode 'scoped' requires it for provider execution.");
+    log("    Bubblewrap is required for isolated execution of agent providers.");
     log("    Install:  sudo apt install bubblewrap  |  sudo pacman -S bubblewrap  |  sudo dnf install bubblewrap");
-    log("    Fallback: agent-mux config set isolation_mode home");
     log("");
   }
 
