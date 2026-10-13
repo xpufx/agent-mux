@@ -143,13 +143,14 @@ Options:
   --profile <name>                            Explicitly select profile (overrides auto-routing)
   --round-robin, --rr                         Alternate healthy accounts sequentially
   --pool <name>                               Request a specific quota pool (e.g. free)
+  --no-bwrap                                  Bypass bubblewrap isolation; run directly on host
   --help, -h                                  Show this help message
 
 Examples:
   agent-mux status                            View all accounts and live quota limits
   agent-mux agy -p "echo hi"                  Auto-route to healthy account and run
   agent-mux agy --profile secondary           Run using a specific account profile
-  agent-mux exec agy --profile p2 -- -p "hi"  Explicit exec with literal arguments
+  agent-mux exec agy --profile p2 --no-bwrap -- -p "hi"  Explicit exec with native flags preserved
   agy --profile primary -p "inspect git"      Direct transparent wrapper invocation
   agent-mux profile list                      List all accounts and authenticating emails
   agent-mux setup                             Configure profiles and transparent wrappers
@@ -421,7 +422,7 @@ async function main() {
     profile: parsedTop.profile,
     pool: parsedTop.pool,
     roundRobin: parsedTop.roundRobin,
-    mode: parsedTop.mode
+    noBwrap: parsedTop.noBwrap
   };
   const args = parsedTop.cmdArgs;
   const cmd = args[0];
@@ -644,7 +645,11 @@ async function main() {
       console.error(`Usage: agent-mux ${cmd} <provider> [options] [--] [args...]`);
       process.exit(1);
     }
-    const code = await executeProvider(args[1], args.slice(2), process.env, topFlags);
+    // Strict POSIX -- separation: everything before -- belongs to agent-mux (already parsed),
+    // everything after -- is passed verbatim to the target CLI.
+    const providerArg = args[1];
+    const targetArgs = args.slice(2);
+    const code = await executeProvider(providerArg, targetArgs, process.env, topFlags);
     process.exit(code);
   }
 

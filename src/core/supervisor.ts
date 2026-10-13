@@ -147,6 +147,8 @@ export interface SupervisorOptions {
   args: string[];
   env?: NodeJS.ProcessEnv;
   surfaceAccount?: SurfaceAccountMode;
+  /** When true, skip bubblewrap isolation even for providers with prepareExecution. */
+  noBwrap?: boolean;
 }
 
 export function buildAccountToolFrame(
@@ -262,7 +264,18 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     };
 
     let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
-    if (adapter.prepareExecution) {
+    if (options.noBwrap) {
+      // Bypass prepareExecution (bwrap); run directly on host with HOME override
+      execTarget = {
+        binary: binaryPath,
+        args: finalArgs,
+        env: {
+          ...baseEnv,
+          HOME: profDir,
+          AGENT_MUX_ACTIVE_PROFILE: currentProfile
+        }
+      };
+    } else if (adapter.prepareExecution) {
       execTarget = adapter.prepareExecution(prof, finalArgs, baseEnv, isolationMode);
     } else {
       execTarget = {

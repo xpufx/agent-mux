@@ -1,7 +1,6 @@
 import { getProviderAdapter } from "../providers/index.js";
 import { selectProfile, applyPoolModel, hasExplicitModelArg } from "./router.js";
 import { runSupervisor } from "./supervisor.js";
-import { getIsolationMode } from "./config.js";
 import { parseArgs, type MuxFlags } from "./args.js";
 import type { ProviderAdapter } from "../types.js";
 import { AGENT_MUX_VERSION } from "./version.js";
@@ -21,7 +20,7 @@ export interface ExecutionOptions {
  * and direct agent-mux CLI invocations (agent-mux run/exec/<provider>).
  *
  * Preserves 100% native CLI fidelity:
- *   - Only strips/handles explicit mux flags (--profile, --pool, --round-robin/--rr, --mux-version)
+ *   - Only strips/handles explicit mux flags (--profile, --pool, --round-robin/--rr, --no-bwrap)
  *   - Passes all native arguments, subcommands, and flags through to the target binary
  *   - Leaves subcommands and info requests (--help, --version) free of injected model flags
  *   - Bypasses multiplexing recursion when running inside an isolated profile environment
@@ -63,12 +62,16 @@ export async function executeProvider(
     });
   }
 
+  // Parse routing flags and --no-bwrap before any other processing
+  const parsed = parseArgs(rawArgs, initialFlags);
+  const noBwrap = parsed.noBwrap || Boolean(env.AGENT_MUX_NO_BWRAP);
+
   // Bypass router if already executing within an isolated profile
   const home = env.HOME || "";
   const isAlreadyIsolated = Boolean(env.AGENT_MUX_ACTIVE_PROFILE || home.includes("/.agent-mux/"));
   if (isAlreadyIsolated) {
     return new Promise<number>((resolve) => {
-      const child = spawn(adapter.defaultBinaryPath, rawArgs, {
+      const child = spawn(adapter.defaultBinaryPath, parsed.cmdArgs, {
         stdio: "inherit",
         env
       });
@@ -77,7 +80,7 @@ export async function executeProvider(
   }
 
   // Handle Claude model filtering catalog when requested for Antigravity
-  if (adapter.id === "antigravity" && rawArgs[0] === "models" && env.AGY_TARGET_POOL === "claude") {
+  if (adapter.id === "antigravity" && parsed.cmdArgs[0] === "models" && env.AGY_TARGET_POOL === "claude") {
     const claudeCatalog = [
       "claude-sonnet-5-5-medium\tClaude Sonnet 5.5 (Medium)",
       "claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)",
@@ -91,10 +94,16 @@ export async function executeProvider(
     return 0;
   }
 
-  // Parse routing flags (--profile/--round-robin/--pool are mux flags,
-  // never passed to the underlying CLI).
-  const parsed = parseArgs(rawArgs, initialFlags);
-  const mode = parsed.mode || env.AGENT_MUX_PROFILE || "auto";
+  // Determine routing mode from parsed flags or environment
+  let mode: string;
+  if (parsed.roundRobin) {
+    mode = "round-robin";
+  } else if (parsed.profile) {
+    mode = parsed.profile;
+  } else {
+    mode = env.AGENT_MUX_PROFILE || "auto";
+  }
+
   const poolOverride = parsed.pool || (adapter.id === "antigravity" ? env.AGY_TARGET_POOL : undefined);
   const cmdArgs = parsed.cmdArgs;
 
@@ -119,6 +128,39 @@ export async function executeProvider(
     ? adapter.isStreamCommand(cmdArgs)
     : cmdArgs.includes("stream-json");
 
+  // --no-bwrap: skip bubblewrap isolation, run directly on host with HOME override
+  if (noBwrap) {
+    const profDir = `${adapter.profilesBaseDir}/${decision.profile}`;
+    const execEnv = {
+      ...env,
+      HOME: profDir,
+      AGENT_MUX_ACTIVE_PROFILE: decision.profile
+    };
+
+    if (isStream) {
+      return await runSupervisor({
+        adapter,
+        initialProfile: decision.profile,
+        initialPool: decision.pool,
+        poolOverride,
+        binaryPath: adapter.defaultBinaryPath,
+        args: cmdArgs,
+        env: execEnv,
+        noBwrap: true
+      });
+    }
+
+    return new Promise<number>((resolve) => {
+      const child = spawn(adapter.defaultBinaryPath, execArgs, {
+        stdio: "inherit",
+        env: execEnv
+      });
+      child.on("close", (code) => {
+        resolve(code ?? 0);
+      });
+    });
+  }
+
   if (isStream) {
     return await runSupervisor({
       adapter,
@@ -131,11 +173,10 @@ export async function executeProvider(
   }
 
   const profDir = `${adapter.profilesBaseDir}/${decision.profile}`;
-  const isolationMode = getIsolationMode();
   let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
 
   if (adapter.prepareExecution) {
-    execTarget = adapter.prepareExecution(decision.profile, execArgs, env, isolationMode);
+    execTarget = adapter.prepareExecution(decision.profile, execArgs, env, undefined);
   } else {
     execTarget = {
       binary: adapter.defaultBinaryPath,
@@ -185,4 +226,3 @@ export function isBinaryWrapped(filePath: string): boolean {
     return false;
   }
 }
-
