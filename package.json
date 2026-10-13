@@ -1,6 +1,6 @@
 {
   "name": "@xpufx/agent-mux",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "High-availability multi-account multiplexer and stream supervisor for AI coding agent CLIs",
   "type": "module",
   "main": "dist/index.js",
