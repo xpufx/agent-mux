@@ -240,6 +240,65 @@ test("supervisor flushes buffered quota stderr when all candidates are exhausted
   );
 });
 
+// --- Quota-vocabulary regression tests (issue #64) ---
+
+const INDIVIDUAL_QUOTA_MSG =
+  "Individual quota reached for model gemini-3.8-flash-low in project xpufx-org/agent-mux. Please retry after 2025-07-15T12:00:00Z.";
+
+// Unit tests for isHardQuotaError / isQuotaError are run via the built dist.
+test("isHardQuotaError matches 'Individual quota reached'", async () => {
+  const { isHardQuotaError } = await import("../dist/index.js");
+  assert.ok(isHardQuotaError(INDIVIDUAL_QUOTA_MSG), "should match individual quota reached");
+  assert.ok(
+    isHardQuotaError("quota reached on project"),
+    "should match plain 'quota reached'"
+  );
+});
+
+test("isQuotaError matches 'Individual quota reached'", async () => {
+  const { isQuotaError } = await import("../dist/index.js");
+  assert.ok(isQuotaError(INDIVIDUAL_QUOTA_MSG), "isQuotaError should match individual quota reached");
+});
+
+test("supervisor suppresses non-fatal 'Individual quota reached' stderr on successful turn", async () => {
+  const caseHome = makeCaseHome("suppress-individual-quota");
+  const childPath = writeChild(
+    caseHome,
+    `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+      `if (profileName === "alice") {\n` +
+      `  setTimeout(() => console.error(${JSON.stringify(INDIVIDUAL_QUOTA_MSG)}), 100);\n` +
+      `  setTimeout(() => process.exit(0), 400);\n` +
+      `} else {\n` +
+      `  setTimeout(() => console.log(JSON.stringify({ event: "result", result: { status: "SUCCESS" } })), 150);\n` +
+      `  setTimeout(() => process.exit(0), 400);\n` +
+      `}\n`
+  );
+  const { driverPath } = writeDriver(caseHome, childPath);
+
+  const { code, stderr } = await runDriver(driverPath, caseHome);
+
+  assert.equal(code, 0, `driver exit (stderr=${stderr.slice(-300)})`);
+  assert.ok(
+    !stderr.includes("Individual quota reached"),
+    `non-fatal quota notice must be suppressed on success, got: ${stderr}`
+  );
+});
+
+test("isProcessCrashQuotaError detects 'Individual quota reached' in buffered stderr", async () => {
+  const { isProcessCrashQuotaError } = await import("../dist/index.js");
+  const lines = [INDIVIDUAL_QUOTA_MSG];
+  assert.equal(
+    isProcessCrashQuotaError(lines),
+    INDIVIDUAL_QUOTA_MSG,
+    "should detect individual quota in buffered stderr"
+  );
+  assert.equal(isProcessCrashQuotaError([]), undefined);
+  assert.equal(
+    isProcessCrashQuotaError(["normal warning line"]),
+    undefined
+  );
+});
+
 test("supervisor dedupes candidate selection logs across turns unless debug is set", async () => {
   const runCase = async (prefix, env) => {
     const caseHome = makeCaseHome(prefix);

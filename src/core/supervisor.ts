@@ -75,6 +75,8 @@ export function isHardQuotaError(text: unknown): boolean {
     t.includes("quota exceeded") ||
     t.includes("quota exhausted") ||
     t.includes("insufficient quota") ||
+    t.includes("individual quota reached") ||
+    t.includes("quota reached") ||
     t.includes("rate limit") ||
     t.includes("rate_limit") ||
     t.includes("rate-limit") ||
@@ -456,7 +458,29 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         }
 
         // Terminal exit: release buffered stderr, filtering out transient retry noise
-        // if the turn completed cleanly with code 0.
+        // and non-fatal quota notices if the turn completed cleanly with code 0.
+        if (code === 0 && turnHadOutput) {
+          // Suppress non-fatal quota/rate-limit notice lines that leak to parent
+          // harnesses on a successful turn. A valid result frame or agent output
+          // already confirmed success; these notices are noise (e.g. "Individual
+          // quota reached" warnings from upstream gateways).
+          const suppressed = new Set<string>();
+          const clean = stderrLines.filter((chunk) => {
+            if (isQuotaError(chunk)) {
+              suppressed.add(chunk);
+              return false;
+            }
+            return true;
+          });
+          stderrLines.length = 0;
+          if (clean.length > 0 || suppressed.size === 0) {
+            flushBufferedStderr(clean);
+          }
+          process.off("SIGINT", onSigInt);
+          process.off("SIGTERM", onSigTerm);
+          resolve(0);
+          return;
+        }
         if (code === 0) {
           const clean = filterTransientNoise(stderrLines);
           stderrLines.length = 0;
