@@ -75,7 +75,10 @@ export function recordCooldown(
   pool: string,
   durationSec: number,
   reason?: string
-): CooldownEntry {
+): CooldownEntry | undefined {
+  if (durationSec <= 0) {
+    return undefined;
+  }
   const cooldowns = loadCooldowns();
   const key = makeCooldownKey(provider, profile, pool);
   const now = Date.now();

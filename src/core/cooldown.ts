@@ -1,4 +1,28 @@
+export function isCapacityError(text: unknown): boolean {
+  if (!text) return false;
+  let raw: string;
+  if (typeof text === "string") {
+    raw = text;
+  } else {
+    try {
+      raw = JSON.stringify(text) ?? "";
+    } catch {
+      raw = String(text);
+    }
+  }
+  const t = raw.toLowerCase();
+  return (
+    t.includes("no capacity available") ||
+    t.includes("capacity available for model") ||
+    (t.includes("503") && (t.includes("unavailable") || t.includes("capacity"))) ||
+    t.includes("api error (attempt")
+  );
+}
+
 export function parseResetDurationSeconds(text: string): number {
+  if (isCapacityError(text)) {
+    return 0;
+  }
   const match = text.match(/Resets in\s+([^.\r\n]+)/i);
   if (match) {
     const duration = match[1];
@@ -15,3 +39,4 @@ export function parseResetDurationSeconds(text: string): number {
   }
   return 3600;
 }
+

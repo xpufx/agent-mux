@@ -271,3 +271,17 @@ test("status is instant by default and probe is opt-in via options.probe (#25)",
   assert.equal(geminiProbed.state, "READY");
   assert.equal(checkCooldown(adapter.id, "okprofile", "gemini").cooling, false);
 });
+
+test("isCapacityError and parseResetDurationSeconds - 503 capacity returns 0 duration (noop cooldown)", async () => {
+  const { isCapacityError, isHardQuotaError } = await import("../dist/index.js");
+  const err503 = "[System Error] API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server";
+  assert.equal(isCapacityError(err503), true);
+  assert.equal(isHardQuotaError(err503), false);
+  assert.equal(parseResetDurationSeconds(err503), 0);
+
+  // recordCooldown with duration 0 is a no-op
+  const entry = recordCooldown("antigravity", "pufaysokt", "gemini", 0, err503);
+  assert.equal(entry, undefined);
+  assert.equal(checkCooldown("antigravity", "pufaysokt", "gemini").cooling, false);
+});
+

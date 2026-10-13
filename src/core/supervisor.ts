@@ -12,9 +12,9 @@ import {
 import { logMuxMessage } from "./state.js";
 import { recordCooldownFamily } from "./pools.js";
 import { selectProfile, candidateKey, applyPoolModel } from "./router.js";
-import { parseResetDurationSeconds } from "./cooldown.js";
+import { parseResetDurationSeconds, isCapacityError } from "./cooldown.js";
 
-export { parseResetDurationSeconds } from "./cooldown.js";
+export { parseResetDurationSeconds, isCapacityError } from "./cooldown.js";
 
 /**
  * Extract readable text from a stream error payload. Engine frames may carry
@@ -52,9 +52,8 @@ export function errorTextOf(value: unknown): string {
   return String(value);
 }
 
-export function isQuotaError(text: unknown): boolean {
+export function isHardQuotaError(text: unknown): boolean {
   if (!text) return false;
-  // Structured payloads must be matched as JSON, not "[object Object]".
   let raw: string;
   if (typeof text === "string") {
     raw = text;
@@ -67,9 +66,6 @@ export function isQuotaError(text: unknown): boolean {
   }
   if (!raw) return false;
   const t = raw.toLowerCase();
-  // Must be an actual resource exhaustion / 429 / rate-limit signal.
-  // Matching runs only against error payloads (result ERROR frames,
-  // error frames, probe output, crash stderr) — never agent prose.
   return (
     t.includes("resource_exhausted") ||
     t.includes("resource exhausted") ||
@@ -86,11 +82,12 @@ export function isQuotaError(text: unknown): boolean {
     t.includes("too many requests") ||
     t.includes("code 429") ||
     t.includes("status 429") ||
-    t.includes("http 429") ||
-    t.includes("no capacity available") ||
-    t.includes("capacity available for model") ||
-    (t.includes("503") && (t.includes("unavailable") || t.includes("capacity")))
+    t.includes("http 429")
   );
+}
+
+export function isQuotaError(text: unknown): boolean {
+  return isHardQuotaError(text) || isCapacityError(text);
 }
 
 export function isProcessCrashQuotaError(stderrLines: string[]): string | undefined {
@@ -103,6 +100,7 @@ export function isProcessCrashQuotaError(stderrLines: string[]): string | undefi
   }
   return undefined;
 }
+
 
 export function isDebugLoggingEnabled(): boolean {
   return Boolean(process.env.DEBUG || process.env.AGENT_MUX_DEBUG);
@@ -336,12 +334,21 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       } catch {}
     }
 
+    function filterTransientNoise(buffer: string[]): string[] {
+      return buffer.filter((chunk) => !isCapacityError(chunk));
+    }
+
     function flushTurnStderr(buffer: string[]): void {
       // A turn that still carries a quota signal stays buffered: the child may
       // exit next and failover could still recover it.
       if (isProcessCrashQuotaError(buffer)) return;
-      flushBufferedStderr(buffer);
+      const clean = filterTransientNoise(buffer);
+      buffer.length = 0;
+      if (clean.length > 0) {
+        flushBufferedStderr(clean);
+      }
     }
+
 
     function attachStdoutListener(proc: ChildProcess, stderrLines: string[], prof: string, pool: string) {
       const rl = readline.createInterface({ input: proc.stdout! });
@@ -427,33 +434,38 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         process.stdout.write(line + "\n");
       });
 
-proc.on("close", async (code) => {
-         if (isRelaunching) return;
-         if (proc.pid && killedChildPids.has(proc.pid)) return;
+      proc.on("close", async (code) => {
+        if (isRelaunching) return;
+        if (proc.pid && killedChildPids.has(proc.pid)) return;
 
-         // Check for quota error in stderr regardless of exit code.
-         // A process may exit 0 but still have printed a quota failure to stderr.
-         const crashLine = isProcessCrashQuotaError(stderrLines);
-         if (crashLine) {
-           await handleRelaunch("Process exited with quota limit", prof, pool, crashLine, undefined, stderrLines);
-           return;
-         }
+        // Check for quota error in stderr regardless of exit code.
+        // A process may exit 0 but still have printed a quota failure to stderr.
+        // However, if the turn succeeded (turnHadOutput) and exited 0, transient retry
+        // warnings (like attempt 1 503) that resolved naturally are NOT crashes.
+        const crashLine = isProcessCrashQuotaError(stderrLines);
+        if (crashLine && (!turnHadOutput || isHardQuotaError(crashLine))) {
+          await handleRelaunch("Process exited with quota limit", prof, pool, crashLine, undefined, stderrLines);
+          return;
+        }
 
-         // Terminal (non-quota) exit: release everything the turn buffered.
-         flushBufferedStderr(stderrLines);
+        // Terminal exit: release buffered stderr, filtering out transient retry noise
+        // if the turn completed cleanly with code 0.
+        if (code === 0) {
+          const clean = filterTransientNoise(stderrLines);
+          stderrLines.length = 0;
+          flushBufferedStderr(clean);
+          process.off("SIGINT", onSigInt);
+          process.off("SIGTERM", onSigTerm);
+          resolve(0);
+          return;
+        }
 
-         // Clean exit: no quota signal in stderr
-         if (code === 0) {
-           process.off("SIGINT", onSigInt);
-           process.off("SIGTERM", onSigTerm);
-           resolve(0);
-           return;
-         }
-
-         process.off("SIGINT", onSigInt);
-         process.off("SIGTERM", onSigTerm);
-         resolve(code ?? 0);
-       });
+        // Terminal (non-quota) exit: release everything the turn buffered.
+        flushBufferedStderr(stderrLines);
+        process.off("SIGINT", onSigInt);
+        process.off("SIGTERM", onSigTerm);
+        resolve(code ?? 0);
+      });
     }
 
     async function handleRelaunch(
@@ -467,9 +479,12 @@ proc.on("close", async (code) => {
       if (isRelaunching) return;
 
       const durSec = parseResetDurationSeconds(errorDetails || "");
-      logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails}`);
-      recordCooldownFamily(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
+      logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails} (cooldown: ${durSec}s)`);
+      if (durSec > 0) {
+        recordCooldownFamily(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
+      }
       triedCandidates.add(candidateKey(failedProfile, failedPool));
+
 
       // Check if a healthy fallback exists in the policy-ordered candidate
       // matrix. The supervisor owns the selection log so repeated turns on the
