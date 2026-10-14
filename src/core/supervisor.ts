@@ -108,6 +108,130 @@ export function isDebugLoggingEnabled(): boolean {
   return Boolean(process.env.DEBUG || process.env.AGENT_MUX_DEBUG);
 }
 
+/** Grace period between group SIGTERM and SIGKILL escalation. */
+export const CHILD_KILL_GRACE_MS = 2000;
+/** Max wait for a replacement child to emit `init` before unblocking failover state. */
+export const RELAUNCH_INIT_TIMEOUT_MS = 15_000;
+
+/**
+ * Effective SIGTERM→SIGKILL escalation grace. Operators and tests may lower
+ * it via `AGENT_MUX_KILL_GRACE_MS` (milliseconds); invalid values fall back
+ * to {@link CHILD_KILL_GRACE_MS}.
+ */
+export function getKillGraceMs(): number {
+  const raw = process.env.AGENT_MUX_KILL_GRACE_MS;
+  if (raw !== undefined) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return CHILD_KILL_GRACE_MS;
+}
+
+/**
+ * Terminate a supervised child and everything it spawned (issue #69).
+ *
+ * Children are spawned detached (own process group), so grandchildren that
+ * inherited stdout/stderr (runaway `grep`, subagent tasks, bwrap members)
+ * would otherwise keep the OS pipe open forever and downstream harnesses
+ * would never observe EOF. Killing only the direct PID leaks those handles.
+ *
+ * Strategy: SIGTERM the whole process group, escalate to SIGKILL after a
+ * grace period, and destroy our local stdio handles so readline consumers
+ * settle promptly. Escalation timers are unref'd so they never hold the
+ * supervisor event loop open.
+ */
+export function killChildTree(
+  proc: ChildProcess,
+  signal: NodeJS.Signals = "SIGTERM",
+  graceMs: number = getKillGraceMs()
+): void {
+  const pid = proc.pid;
+  const canGroupKill = typeof pid === "number" && process.platform !== "win32";
+  const sendSignal = (sig: NodeJS.Signals): void => {
+    try {
+      if (canGroupKill) {
+        process.kill(-(pid as number), sig);
+      } else {
+        proc.kill(sig);
+      }
+    } catch {
+      try {
+        proc.kill(sig);
+      } catch {}
+    }
+  };
+
+  sendSignal(signal);
+
+  if (graceMs > 0 && proc.exitCode === null) {
+    const timer = setTimeout(() => {
+      if (proc.exitCode === null) {
+        sendSignal("SIGKILL");
+      }
+    }, graceMs);
+    try {
+      timer.unref?.();
+    } catch {}
+    proc.once("exit", () => clearTimeout(timer));
+  }
+
+  // Release our pipe ends promptly so local readline interfaces settle even
+  // if orphaned grandchildren still hold the write end open.
+  try {
+    proc.stdin?.destroy?.();
+  } catch {}
+  try {
+    (proc.stdout as unknown as { destroy?: () => void })?.destroy?.();
+  } catch {}
+  try {
+    (proc.stderr as unknown as { destroy?: () => void })?.destroy?.();
+  } catch {}
+}
+
+/**
+ * Build the terminal abort frame emitted when a failover kills a turn that
+ * already produced output (issue #69).
+ *
+ * The frame mirrors the engine's own `{ event: "result", result: { status } }`
+ * shape so downstream NDJSON consumers finalize the turn as failed instead
+ * of waiting forever. It is namespaced (`agent_mux_failover_abort`) and
+ * always `ERROR` — agent-mux never fabricates success.
+ */
+export function buildTurnAbortFrame(
+  conversationId: string | null,
+  fromProfile: string,
+  fromPool: string,
+  toProfile: string,
+  toPool: string,
+  reason: string,
+  failedOver = true
+): string {
+  const outcome = failedOver
+    ? `Failed over to '${toProfile}' (pool: ${toPool}). ` +
+      `Partial output above is incomplete; retry your last message.`
+    : `No healthy fallback profile is available; the turn cannot continue.`;
+  const frame: Record<string, unknown> = {
+    event: "result",
+    result: {
+      status: "ERROR",
+      error:
+        `[agent-mux] Turn aborted mid-stream: ${reason} on '${fromProfile}' ` +
+        `(pool: ${fromPool}). ${outcome}`
+    },
+    agent_mux_failover_abort: {
+      from: fromProfile,
+      from_pool: fromPool,
+      to: failedOver ? toProfile : null,
+      to_pool: failedOver ? toPool : null,
+      reason
+    }
+  };
+  if (conversationId) {
+    frame.conversation_id = conversationId;
+  }
+  return JSON.stringify(frame);
+}
+
 export interface CandidateSelectionLogger {
   log(profile: string, pool: string, reason: string): boolean;
   lastSelected(): string | null;
@@ -233,6 +357,9 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   let hadFailover = false;
   let failoverPrevProfile: string | null = null;
   let turnHadOutput = false;
+  // Set once a terminal frame (engine result or synthetic abort) has closed
+  // the active turn, so failover never emits a second terminal frame.
+  let turnAborted = false;
 
   function injectAccountFrame(isFailover = false, prevProfile?: string) {
     if (surfaceMode !== "tool" && surfaceMode !== "both") return;
@@ -290,7 +417,11 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
     const proc = spawn(execTarget.binary, execTarget.args, {
       env: execTarget.env,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      // Own process group per child (issue #69): failover must be able to
+      // SIGTERM/SIGKILL grandchildren holding inherited stdout/stderr fds,
+      // otherwise the OS pipe never reaches EOF for downstream consumers.
+      detached: process.platform !== "win32"
     });
 
     const stderrLines: string[] = [];
@@ -320,6 +451,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         turnSurfaced = false;
         turnMessagePrefixed = false;
         turnHadOutput = false;
+        turnAborted = false;
         relaunchCount = 0;
         triedCandidates.clear();
         triedCandidates.add(candidateKey(currentProfile, currentPool));
@@ -341,8 +473,8 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     }
   });
 
-  const onSigInt = () => { if (child) child.kill("SIGINT"); };
-  const onSigTerm = () => { if (child) child.kill("SIGTERM"); };
+  const onSigInt = () => { if (child) killChildTree(child, "SIGINT"); };
+  const onSigTerm = () => { if (child) killChildTree(child, "SIGTERM"); };
   process.on("SIGINT", onSigInt);
   process.on("SIGTERM", onSigTerm);
 
@@ -377,6 +509,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
       rl.on("line", async (line) => {
         let quotaDetected = false;
+        let quotaTriggerWasTerminal = false;
         let parsedFrame: any = null;
         let errorDetails = "";
 
@@ -401,12 +534,18 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             const res = parsedFrame.result || {};
             if (res.status === "ERROR" && isQuotaError(res.error)) {
               quotaDetected = true;
+              // The engine already closed this turn with its own terminal
+              // frame (issue #69): forward it below for downstream finality
+              // and fail over only for session continuity — never emit a
+              // second synthetic terminal frame for the same turn.
+              quotaTriggerWasTerminal = true;
               errorDetails = errorTextOf(res.error);
             } else {
               lastUserMessage = null;
               turnSurfaced = false;
               turnMessagePrefixed = false;
               turnHadOutput = false;
+              turnAborted = true;
               hadFailover = false;
               failoverPrevProfile = null;
               relaunchCount = 0;
@@ -421,7 +560,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         } catch {}
 
         if (quotaDetected) {
-          await handleRelaunch("Quota exhausted", prof, pool, errorDetails, line, stderrLines);
+          await handleRelaunch("Quota exhausted", prof, pool, errorDetails, line, stderrLines, quotaTriggerWasTerminal);
           return;
         }
 
@@ -518,9 +657,51 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       failedPool: string,
       errorDetails?: string,
       rawErrorLine?: string,
-      bufferedStderr: string[] = []
+      bufferedStderr: string[] = [],
+      triggerWasTerminal = false
     ) {
       if (isRelaunching) return;
+
+      // Snapshot the interrupted turn before any async work (issue #69). A
+      // turn that already streamed output can never be replayed without
+      // double-executing tools, so killing its child orphans it unless we
+      // close it explicitly.
+      const abortedHadOutput = turnHadOutput;
+      const abortedTurnOpen = (lastUserMessage !== null || turnHadOutput) && !turnAborted;
+
+      // When the quota signal arrived as the engine's own terminal `result`
+      // frame, forward it verbatim: downstream already has turn finality and
+      // failover below only warms the replacement for the *next* turn. This
+      // must never be swallowed — swallowing the terminal frame is the wedge.
+      if (triggerWasTerminal && rawErrorLine) {
+        try {
+          process.stdout.write(rawErrorLine + "\n");
+        } catch {}
+        lastUserMessage = null;
+        turnSurfaced = false;
+        turnMessagePrefixed = false;
+        turnHadOutput = false;
+        turnAborted = true;
+      }
+
+      /** Close the interrupted turn exactly once when the engine never did. */
+      const abortInterruptedTurn = (fromProf: string, fromP: string, toProf: string, toP: string, failedOver = true): void => {
+        if (turnAborted || triggerWasTerminal) return;
+        // Only turns that produced output need synthetic finality: a
+        // pre-output turn is replayed verbatim into the replacement child.
+        if (!abortedHadOutput) return;
+        if (!abortedTurnOpen && lastUserMessage === null && !turnHadOutput) return;
+        try {
+          process.stdout.write(
+            buildTurnAbortFrame(conversationId, fromProf, fromP, toProf, toP, reason, failedOver) + "\n"
+          );
+        } catch {}
+        turnAborted = true;
+        lastUserMessage = null;
+        turnSurfaced = false;
+        turnMessagePrefixed = false;
+        turnHadOutput = false;
+      };
 
       const durSec = parseResetDurationSeconds(errorDetails || "");
       logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails} (cooldown: ${durSec}s)`);
@@ -547,16 +728,16 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         );
       } catch (err) {
         // Failover could not be scheduled: the failure is terminal, so the raw
-        // buffered stderr must reach the caller.
+        // buffered stderr must reach the caller — plus an explicit abort frame
+        // when the engine never closed the active turn (issue #69).
         flushBufferedStderr(bufferedStderr);
         logMuxMessage("SUPERVISOR", `Failover failed: ${(err as Error)?.message ?? String(err)}`);
         isRelaunching = true;
         if (child) {
-          try {
-            if (child.pid) killedChildPids.add(child.pid);
-            child.kill("SIGTERM");
-          } catch {}
+          if (child.pid) killedChildPids.add(child.pid);
+          killChildTree(child);
         }
+        abortInterruptedTurn(failedProfile, failedPool, failedProfile, failedPool, false);
         process.off("SIGINT", onSigInt);
         process.off("SIGTERM", onSigTerm);
         resolve(1);
@@ -604,12 +785,11 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         `\n[agent-mux] ${reason} on ${prevProf} (pool: ${prevPool}). Automatically switching to healthy profile: ${nextProf} (pool: ${nextPool})...\n`
       );
 
-      // Kill previous child
+      // Kill the previous child tree (process group, issue #69): SIGTERM only
+      // the direct PID leaks grandchildren holding inherited stdio fds.
       if (child) {
-        try {
-          if (child.pid) killedChildPids.add(child.pid);
-          child.kill("SIGTERM");
-        } catch {}
+        if (child.pid) killedChildPids.add(child.pid);
+        killChildTree(child);
       }
 
       currentProfile = nextProf;
@@ -620,6 +800,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       // Inject failover tool frame upstream immediately
       injectAccountFrame(true, prevProf);
 
+      // Close the orphaned turn BEFORE the replacement serves new input, so
+      // downstream finalizes the killed turn even if the new child idles.
+      abortInterruptedTurn(prevProf, prevPool, nextProf, nextPool);
+
       const newSpawn = spawnChild(currentProfile);
       const newChild = newSpawn.proc;
       child = newChild;
@@ -628,12 +812,52 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       let initConsumed = false;
       const rl = readline.createInterface({ input: newChild.stdout! });
 
+      // Guard: a replacement that never becomes ready must not wedge the
+      // supervisor in `isRelaunching` forever (issue #69).
+      const initTimer = setTimeout(() => {
+        if (!initConsumed) {
+          initConsumed = true;
+          isRelaunching = false;
+          logMuxMessage("SUPERVISOR", `Replacement child for '${currentProfile}' never emitted init; failover state released`);
+          try {
+            rl.close();
+          } catch {}
+        }
+      }, RELAUNCH_INIT_TIMEOUT_MS);
+      try {
+        initTimer.unref?.();
+      } catch {}
+
+      const settleInit = (replacementDead: boolean, code: number | null): void => {
+        if (initConsumed) return;
+        initConsumed = true;
+        clearTimeout(initTimer);
+        isRelaunching = false;
+        try {
+          rl.close();
+        } catch {}
+        if (replacementDead) {
+          // No healthy child left to serve the session: close any still-open
+          // turn explicitly, then exit instead of hanging on stdout.
+          if ((lastUserMessage !== null || turnHadOutput) && !turnAborted && !triggerWasTerminal) {
+            abortInterruptedTurn(prevProf, prevPool, nextProf, nextPool);
+          }
+          flushBufferedStderr(newSpawn.stderrLines);
+          process.off("SIGINT", onSigInt);
+          process.off("SIGTERM", onSigTerm);
+          resolve(code ?? 1);
+        }
+      };
+      newChild.once("close", (code) => settleInit(true, code));
+      newChild.once("error", () => settleInit(true, null));
+
       rl.on("line", (line) => {
         if (!initConsumed) {
           try {
             const frame = JSON.parse(line);
             if (frame.event === "init") {
               initConsumed = true;
+              clearTimeout(initTimer);
               isRelaunching = false;
               turnSurfaced = false;
               rl.close();
