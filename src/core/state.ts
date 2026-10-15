@@ -99,10 +99,24 @@ export function recordCooldown(
   return entry;
 }
 
-export function clearCooldown(provider: string, profile: string, pool: string): void {
+export function clearCooldown(
+  provider: string,
+  profile: string,
+  pool: string,
+  options?: { onlyIfShort?: boolean }
+): void {
   const cooldowns = loadCooldowns();
   const key = makeCooldownKey(provider, profile, pool);
-  if (cooldowns[key]) {
+  const entry = cooldowns[key];
+  if (entry) {
+    if (options?.onlyIfShort) {
+      // If remaining cooldown is more than 5 minutes, it is a genuine quota exhaustion.
+      // Do not clear it purely due to clean exit or non-inference turn frames.
+      const remainingSec = Math.floor((entry.resetAt - Date.now()) / 1000);
+      if (remainingSec > 300) {
+        return;
+      }
+    }
     delete cooldowns[key];
     saveCooldowns(cooldowns);
     logMuxMessage("COOLDOWN", `Cleared cooldown on ${key}`);

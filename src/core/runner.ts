@@ -7,6 +7,7 @@ import { AGENT_MUX_VERSION } from "./version.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { clearCooldown } from "./state.js";
 
 export interface ExecutionOptions {
   adapter: ProviderAdapter;
@@ -156,6 +157,9 @@ export async function executeProvider(
         env: execEnv
       });
       child.on("close", (code) => {
+        if (code === 0) {
+          clearCooldown(adapter.id, decision.profile, decision.pool);
+        }
         resolve(code ?? 0);
       });
     });
@@ -200,6 +204,9 @@ export async function executeProvider(
     });
 
     child.on("close", (code) => {
+      if (code === 0) {
+        clearCooldown(adapter.id, decision.profile, decision.pool, { onlyIfShort: true });
+      }
       resolve(code ?? 0);
     });
   });

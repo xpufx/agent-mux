@@ -10,9 +10,8 @@ import {
   SANDBOX_GUARD_MESSAGE,
   type ProfileInfo
 } from "../core/profiles.js";
-import { parseResetDurationSeconds } from "../core/supervisor.js";
+import { verifyCooldownWithProbe } from "../core/supervisor.js";
 import { clearCooldown } from "../core/state.js";
-import { recordCooldownFamily } from "../core/pools.js";
 import { spawn } from "node:child_process";
 import { executeProvider, isBinaryWrapped } from "../core/runner.js";
 import { parseArgs } from "../core/args.js";
@@ -72,14 +71,10 @@ async function runProbe(providerId: string, profile?: string, pool?: string) {
       const poolsToProbe = pool ? [pool] : prov.getSupportedPools();
       for (const pl of poolsToProbe) {
         process.stdout.write(`  [Probing ${prof} (${pl})]... `);
-        const res = await prov.probe(prof, pl);
+        // Probe-driven cooldown clearing (issue #74): only an explicit probe
+        // confirming READY clears the lock; LIMIT re-records it.
+        const res = await verifyCooldownWithProbe(prov, prof, pl);
         console.log(`[${res.state}: ${res.details}]`);
-        if (res.state === "READY") {
-          clearCooldown(prov.id, prof, pl);
-        } else if (res.state === "LIMIT") {
-          const durSec = parseResetDurationSeconds(res.details);
-          recordCooldownFamily(prov.id, prof, pl, durSec, res.details);
-        }
       }
     } else {
       console.log("  (Provider does not require server-side probing)");

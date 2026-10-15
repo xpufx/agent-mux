@@ -69,3 +69,18 @@ test("clearCooldownsMatching - no match clears nothing", () => {
   assert.equal(n, 0);
   assert.equal(Object.keys(loadCooldowns()).length, 4);
 });
+
+test("clearCooldown - with onlyIfShort retains long cooldown (>300s)", async () => {
+  const { clearCooldown } = await import("../dist/index.js");
+  seed();
+  // alice:gemini has 3600s cooldown
+  clearCooldown("antigravity", "alice", "gemini", { onlyIfShort: true });
+  assert.equal(checkCooldown("antigravity", "alice", "gemini").cooling, true, "long cooldown must not be cleared with onlyIfShort");
+
+  // short cooldown (60s)
+  recordCooldown("antigravity", "alice", "gemini", 60, "short test");
+  assert.equal(checkCooldown("antigravity", "alice", "gemini").cooling, true);
+  clearCooldown("antigravity", "alice", "gemini", { onlyIfShort: true });
+  assert.equal(checkCooldown("antigravity", "alice", "gemini").cooling, false, "short cooldown must be cleared with onlyIfShort");
+});
+

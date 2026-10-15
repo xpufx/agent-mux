@@ -1,15 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import path from "node:path";
-import type { ProviderAdapter, RoutingDecision } from "../types.js";
+import type { ProviderAdapter, QuotaState, RoutingDecision } from "../types.js";
 import { listProfiles, ensureProfile } from "./profiles.js";
 import {
   getSurfaceAccountMode,
   getIsolationMode,
   getRoutingPolicy,
+  type IsolationMode,
   type SurfaceAccountMode
 } from "./config.js";
-import { logMuxMessage } from "./state.js";
+import { logMuxMessage, clearCooldown } from "./state.js";
 import { recordCooldownFamily } from "./pools.js";
 import { selectProfile, candidateKey, applyPoolModel, hasExplicitModelArg } from "./router.js";
 import { parseResetDurationSeconds, isCapacityError } from "./cooldown.js";
@@ -102,6 +103,29 @@ export function isProcessCrashQuotaError(stderrLines: string[]): string | undefi
   }
   return undefined;
 }
+
+/**
+ * Detect rate limits from non-inference background hooks (e.g. context summarization,
+ * experiments, model catalog discovery) rather than actual model generation quota.
+ */
+export function isNonInferenceHookError(text: unknown): boolean {
+  if (typeof text !== "string") {
+    try {
+      text = JSON.stringify(text) ?? "";
+    } catch {
+      text = String(text);
+    }
+  }
+  const t = (text as string).toLowerCase();
+  return (
+    t.includes("context summarization") ||
+    t.includes("pre-invocation hook") ||
+    t.includes("fetchavailablemodels") ||
+    t.includes("telemetry") ||
+    t.includes("experiment refresh")
+  );
+}
+
 
 
 export function isDebugLoggingEnabled(): boolean {
@@ -261,6 +285,184 @@ export function createCandidateSelectionLogger(
   };
 }
 
+/**
+ * Cooldowns longer than this threshold are genuine quota exhaustions: they
+ * must NOT be healed by superficial stream events or bare process exits.
+ * They clear only via explicit probe verification (`agent-mux probe`
+ * confirming READY) or deterministic turn completion (`result SUCCESS`
+ * produced by that specific profile). Shorter transient locks may heal on
+ * duration expiry / clean exit.
+ *
+ * (issue #74)
+ */
+export const LONG_COOLDOWN_THRESHOLD_SEC = 300;
+
+/**
+ * A single supervised child execution for one `(profile, pool)` candidate.
+ *
+ * All lifecycle state — the child process handle, the buffered stderr, and
+ * the retired flag — is strictly scoped to this instance. Once an attempt
+ * is retired (failover initiated), its late-arriving `close`/`error`/stderr
+ * events must be dropped by the supervisor instead of being evaluated in
+ * the context of the replacement candidate. Cooldown attribution always
+ * uses this attempt's own `profile`/`pool`, never the supervisor's mutable
+ * `currentProfile`/`currentPool`.
+ *
+ * (issue #74: per-candidate process lifecycle isolation)
+ */
+export class CandidateAttempt {
+  readonly id: number;
+  readonly profile: string;
+  readonly pool: string;
+  readonly proc: ChildProcess;
+  readonly stderrLines: string[] = [];
+  retired = false;
+
+  constructor(id: number, profile: string, pool: string, proc: ChildProcess) {
+    this.id = id;
+    this.profile = profile;
+    this.pool = pool;
+    this.proc = proc;
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      // Buffered per attempt: a quota failure that failover recovers from
+      // must never reach the calling harness as a raw error banner, and a
+      // dying attempt's late stderr must never be attributed to its
+      // replacement.
+      this.stderrLines.push(chunk.toString());
+    });
+  }
+
+  get key(): string {
+    return candidateKey(this.profile, this.pool);
+  }
+
+  /**
+   * Retire this attempt exactly once: mark it so all of its late process
+   * events are ignored, record its pid so stray close handlers skip it,
+   * and terminate its whole process tree.
+   */
+  retire(retiredPids?: Set<number>, signal: NodeJS.Signals = "SIGTERM"): void {
+    if (this.retired) return;
+    this.retired = true;
+    if (this.proc.pid !== undefined && retiredPids) {
+      retiredPids.add(this.proc.pid);
+    }
+    killChildTree(this.proc, signal);
+  }
+}
+
+export interface ExecuteCandidateAttemptOptions {
+  adapter: ProviderAdapter;
+  profile: string;
+  pool: string;
+  attemptId: number;
+  /** Supervisor-resolved CLI args for this candidate (pool model applied). */
+  args: string[];
+  baseEnv: NodeJS.ProcessEnv;
+  binaryPath: string;
+  conversationId: string | null;
+  isolationMode: IsolationMode;
+  /** When true, skip bubblewrap isolation even for providers with prepareExecution. */
+  noBwrap?: boolean;
+}
+
+/**
+ * Spawn an isolated child execution for one candidate attempt
+ * (issue #74).
+ *
+ * The replacement candidate always launches with a completely clean stderr
+ * buffer and a freshly resolved execution environment — no state is shared
+ * with, or inherited from, a previously failed attempt.
+ */
+export function executeCandidateAttempt(options: ExecuteCandidateAttemptOptions): CandidateAttempt {
+  const {
+    adapter,
+    profile,
+    pool,
+    attemptId,
+    args,
+    baseEnv,
+    binaryPath,
+    conversationId,
+    isolationMode,
+    noBwrap
+  } = options;
+  const profDir = ensureProfile(adapter, profile);
+
+  const finalArgs = [...args];
+  if (conversationId && !finalArgs.includes("--conversation")) {
+    finalArgs.push("--conversation", conversationId);
+  }
+
+  let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
+  if (noBwrap) {
+    // Bypass prepareExecution (bwrap); run directly on host with HOME override
+    execTarget = {
+      binary: binaryPath,
+      args: finalArgs,
+      env: {
+        ...baseEnv,
+        HOME: profDir,
+        AGENT_MUX_ACTIVE_PROFILE: profile
+      }
+    };
+  } else if (adapter.prepareExecution) {
+    execTarget = adapter.prepareExecution(profile, finalArgs, baseEnv, isolationMode);
+  } else {
+    execTarget = {
+      binary: binaryPath,
+      args: finalArgs,
+      env: {
+        ...baseEnv,
+        HOME: profDir
+      }
+    };
+  }
+
+  const proc = spawn(execTarget.binary, execTarget.args, {
+    env: execTarget.env,
+    stdio: ["pipe", "pipe", "pipe"],
+    // Own process group per child (issue #69): failover must be able to
+    // SIGTERM/SIGKILL grandchildren holding inherited stdout/stderr fds,
+    // otherwise the OS pipe never reaches EOF for downstream consumers.
+    detached: process.platform !== "win32"
+  });
+
+  return new CandidateAttempt(attemptId, profile, pool, proc);
+}
+
+/**
+ * Probe-driven cooldown verification (issue #74).
+ *
+ * Active cooldowns clear only when an explicit probe confirms the
+ * `(profile, pool)` candidate is READY again. A LIMIT probe re-records the
+ * lock against that same candidate. Candidates whose provider exposes no
+ * probe are left untouched.
+ */
+export async function verifyCooldownWithProbe(
+  adapter: ProviderAdapter,
+  profile: string,
+  pool: string
+): Promise<{ state: QuotaState; details: string; cleared: boolean }> {
+  if (!adapter.probe) {
+    return {
+      state: "READY",
+      details: "Provider does not require server-side probing",
+      cleared: false
+    };
+  }
+  const res = await adapter.probe(profile, pool);
+  if (res.state === "READY") {
+    clearCooldown(adapter.id, profile, pool);
+    return { state: res.state, details: res.details, cleared: true };
+  }
+  if (res.state === "LIMIT") {
+    const durSec = parseResetDurationSeconds(res.details);
+    recordCooldownFamily(adapter.id, profile, pool, durSec, res.details);
+  }
+  return { state: res.state, details: res.details, cleared: false };
+}
+
 export interface SupervisorOptions {
   adapter: ProviderAdapter;
   initialProfile: string;
@@ -342,10 +544,15 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     }
   }
 
-  let child: ChildProcess | null = null;
-  let lastUserMessage: string | null = null;
-  let activeChildStderr: string[] = [];
+  // --- Issue #74: per-candidate isolated lifecycle ---
+  // No child process state is shared between attempts. Each candidate runs
+  // inside its own CandidateAttempt (own proc handle, own stderr buffer,
+  // own listeners). Retired attempts have all of their late process events
+  // dropped, so a dying child can never be evaluated as its replacement.
+  let attemptSeq = 0;
+  let activeAttempt: CandidateAttempt | null = null;
   const killedChildPids = new Set<number>();
+  let lastUserMessage: string | null = null;
   const selectionLogger = createCandidateSelectionLogger();
   let isRelaunching = false;
   let relaunchCount = 0;
@@ -376,67 +583,38 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     } catch {}
   }
 
-  function spawnChild(prof: string): { proc: ChildProcess; stderrLines: string[] } {
-    const profDir = ensureProfile(adapter, prof);
-    const isolationMode = getIsolationMode();
-
-    const finalArgs = [...currentArgs];
-    if (conversationId && !finalArgs.includes("--conversation")) {
-      finalArgs.push("--conversation", conversationId);
-    }
-
-    const baseEnv = {
-      ...process.env,
-      ...options.env
-    };
-
-    let execTarget: { binary: string; args: string[]; env: NodeJS.ProcessEnv };
-    if (options.noBwrap) {
-      // Bypass prepareExecution (bwrap); run directly on host with HOME override
-      execTarget = {
-        binary: binaryPath,
-        args: finalArgs,
-        env: {
-          ...baseEnv,
-          HOME: profDir,
-          AGENT_MUX_ACTIVE_PROFILE: currentProfile
-        }
-      };
-    } else if (adapter.prepareExecution) {
-      execTarget = adapter.prepareExecution(prof, finalArgs, baseEnv, isolationMode);
-    } else {
-      execTarget = {
-        binary: binaryPath,
-        args: finalArgs,
-        env: {
-          ...baseEnv,
-          HOME: profDir
-        }
-      };
-    }
-
-    const proc = spawn(execTarget.binary, execTarget.args, {
-      env: execTarget.env,
-      stdio: ["pipe", "pipe", "pipe"],
-      // Own process group per child (issue #69): failover must be able to
-      // SIGTERM/SIGKILL grandchildren holding inherited stdout/stderr fds,
-      // otherwise the OS pipe never reaches EOF for downstream consumers.
-      detached: process.platform !== "win32"
+  /**
+   * Spawn an isolated execution for one candidate. The attempt becomes the
+   * active attempt; every listener created for it is guarded by
+   * {@link isCurrentAttempt} so superseded attempts stay silent.
+   */
+  function spawnAttempt(prof: string, pool: string): CandidateAttempt {
+    const attempt = executeCandidateAttempt({
+      adapter,
+      profile: prof,
+      pool,
+      attemptId: ++attemptSeq,
+      args: [...currentArgs],
+      baseEnv: { ...process.env, ...options.env },
+      binaryPath,
+      conversationId,
+      isolationMode: getIsolationMode(),
+      noBwrap: options.noBwrap
     });
-
-    const stderrLines: string[] = [];
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      // Buffer the whole turn: a quota failure that failover recovers from
-      // must never reach the calling harness as a raw error banner.
-      stderrLines.push(chunk.toString());
-    });
-
-    return { proc, stderrLines };
+    activeAttempt = attempt;
+    return attempt;
   }
 
-  const initialSpawn = spawnChild(currentProfile);
-  child = initialSpawn.proc;
-  activeChildStderr = initialSpawn.stderrLines;
+  /** True only for the live attempt: retired or superseded attempts are silent. */
+  function isCurrentAttempt(attempt: CandidateAttempt): boolean {
+    return !attempt.retired && activeAttempt !== null && activeAttempt.id === attempt.id;
+  }
+
+  function activeChild(): ChildProcess | null {
+    return activeAttempt?.proc ?? null;
+  }
+
+  const initialAttempt = spawnAttempt(currentProfile, currentPool);
   selectionLogger.log(currentProfile, currentPool, "initial selection");
 
   // Pipe stdin from parent to active child
@@ -446,7 +624,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       const data = JSON.parse(line);
       if (data.event === "user") {
         lastUserMessage = line;
-        activeChildStderr.length = 0; // Clear stale stderr from previous turns
+        // Clear the ACTIVE attempt's stale stderr from previous turns. A
+        // retired attempt keeps its own buffer, which failover already
+        // suppressed or flushed — it is never touched here.
+        if (activeAttempt) activeAttempt.stderrLines.length = 0;
         selectionLogger.log(currentProfile, currentPool, "active candidate for turn");
         turnSurfaced = false;
         turnMessagePrefixed = false;
@@ -458,27 +639,40 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       }
     } catch {}
 
-    if (child && child.stdin && !child.stdin.destroyed) {
+    const target = activeChild();
+    if (target && target.stdin && !target.stdin.destroyed) {
       try {
-        child.stdin.write(line + "\n");
+        target.stdin.write(line + "\n");
       } catch {}
     }
   });
 
   parentStdinLines.on("close", () => {
-    if (child && child.stdin && !child.stdin.destroyed) {
+    const target = activeChild();
+    if (target && target.stdin && !target.stdin.destroyed) {
       try {
-        child.stdin.end();
+        target.stdin.end();
       } catch {}
     }
   });
 
-  const onSigInt = () => { if (child) killChildTree(child, "SIGINT"); };
-  const onSigTerm = () => { if (child) killChildTree(child, "SIGTERM"); };
+  const onSigInt = () => { const t = activeChild(); if (t) killChildTree(t, "SIGINT"); };
+  const onSigTerm = () => { const t = activeChild(); if (t) killChildTree(t, "SIGTERM"); };
   process.on("SIGINT", onSigInt);
   process.on("SIGTERM", onSigTerm);
 
   return new Promise<number>((resolve) => {
+    // Settle exactly once: late events from retired attempts must never
+    // resolve the session a second time (issue #74).
+    let settled = false;
+    function finish(code: number): void {
+      if (settled) return;
+      settled = true;
+      process.off("SIGINT", onSigInt);
+      process.off("SIGTERM", onSigTerm);
+      resolve(code);
+    }
+
     function flushBufferedStderr(buffer: string[]): void {
       if (buffer.length === 0) return;
       const text = buffer.join("");
@@ -504,10 +698,21 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
     }
 
 
-    function attachStdoutListener(proc: ChildProcess, stderrLines: string[], prof: string, pool: string) {
+    function attachStdoutListener(attempt: CandidateAttempt) {
+      const proc = attempt.proc;
+      const stderrLines = attempt.stderrLines;
+      // Strict attribution: these are the emitting candidate's own identity,
+      // captured by value. They never follow the supervisor's mutable
+      // currentProfile/currentPool (issue #74).
+      const prof = attempt.profile;
+      const pool = attempt.pool;
       const rl = readline.createInterface({ input: proc.stdout! });
 
       rl.on("line", async (line) => {
+        // Lifecycle isolation: late output from a retired or superseded
+        // attempt is dropped — it must never be evaluated as, or forwarded
+        // on behalf of, the replacement candidate.
+        if (!isCurrentAttempt(attempt)) return;
         let quotaDetected = false;
         let quotaTriggerWasTerminal = false;
         let parsedFrame: any = null;
@@ -527,6 +732,8 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             const su = parsedFrame.step_update;
             if (su && (su.step_type === "agent_response" || su.step_type === "tool")) {
               turnHadOutput = true;
+              // Issue #74: superficial stream events NEVER clear cooldowns.
+              // Only an explicit probe (READY) or a full SUCCESS turn clears.
             }
           }
 
@@ -534,13 +741,18 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             const res = parsedFrame.result || {};
             if (res.status === "ERROR" && isQuotaError(res.error)) {
               quotaDetected = true;
-              // The engine already closed this turn with its own terminal
-              // frame (issue #69): forward it below for downstream finality
-              // and fail over only for session continuity — never emit a
-              // second synthetic terminal frame for the same turn.
-              quotaTriggerWasTerminal = true;
+              // Only treat as terminal (forwarded) if turn already had output.
+              // If turn had NO output, we can replay seamlessly to the fallback child
+              // without surfacing the 429 result frame to the client.
+              quotaTriggerWasTerminal = turnHadOutput;
               errorDetails = errorTextOf(res.error);
             } else {
+              if (res.status === "SUCCESS") {
+                // Verified turn completion produced by THIS profile: the
+                // candidate demonstrably serves again, so its cooldown clears
+                // deterministically — even a long quota exhaustion.
+                clearCooldown(adapter.id, prof, pool);
+              }
               lastUserMessage = null;
               turnSurfaced = false;
               turnMessagePrefixed = false;
@@ -550,7 +762,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               failoverPrevProfile = null;
               relaunchCount = 0;
               triedCandidates.clear();
-              triedCandidates.add(candidateKey(currentProfile, currentPool));
+              triedCandidates.add(candidateKey(prof, pool));
               flushTurnStderr(stderrLines);
             }
           } else if (eventType === "error" && isQuotaError(parsedFrame.error)) {
@@ -560,7 +772,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         } catch {}
 
         if (quotaDetected) {
-          await handleRelaunch("Quota exhausted", prof, pool, errorDetails, line, stderrLines, quotaTriggerWasTerminal);
+          await handleRelaunch(attempt, "Quota exhausted", errorDetails, line, quotaTriggerWasTerminal);
           return;
         }
 
@@ -596,22 +808,33 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       });
 
       proc.on("close", async (code) => {
+        // Lifecycle isolation (issue #74): a retired attempt's close event,
+        // or the close of an attempt superseded by failover, is dropped. It
+        // must never be evaluated in — or attribute quota to — the
+        // replacement candidate.
+        if (attempt.retired) return;
+        if (!isCurrentAttempt(attempt)) return;
         if (isRelaunching) return;
         if (proc.pid && killedChildPids.has(proc.pid)) return;
 
-        // Check for quota error in stderr regardless of exit code.
-        // A process may exit 0 but still have printed a quota failure to stderr.
+        // Check for quota error in stderr.
+        // A process may exit non-zero or exit without producing turn output due to quota.
         // However, if the turn succeeded (turnHadOutput) and exited 0, transient retry
-        // warnings (like attempt 1 503) that resolved naturally are NOT crashes.
+        // warnings or non-fatal background hook notices are NOT crashes.
+        const isCleanSuccess = (code === 0 || code === null) && turnHadOutput;
         const crashLine = isProcessCrashQuotaError(stderrLines);
-        if (crashLine && (!turnHadOutput || isHardQuotaError(crashLine))) {
-          await handleRelaunch("Process exited with quota limit", prof, pool, crashLine, undefined, stderrLines);
+        if (crashLine && !isCleanSuccess) {
+          await handleRelaunch(attempt, "Process exited with quota limit", crashLine, undefined);
           return;
         }
 
         // Terminal exit: release buffered stderr, filtering out transient retry noise
         // and non-fatal quota notices if the turn completed cleanly with code 0.
+        // Issue #74: a bare exit-0 only heals SHORT transient locks; a genuine
+        // long quota exhaustion requires probe verification or a full SUCCESS
+        // turn (handled on the result frame above).
         if (code === 0 && turnHadOutput) {
+          clearCooldown(adapter.id, prof, pool, { onlyIfShort: true });
           // Suppress non-fatal quota/rate-limit notice lines that leak to parent
           // harnesses on a successful turn. A valid result frame or agent output
           // already confirmed success; these notices are noise (e.g. "Individual
@@ -628,39 +851,42 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
           if (clean.length > 0 || suppressed.size === 0) {
             flushBufferedStderr(clean);
           }
-          process.off("SIGINT", onSigInt);
-          process.off("SIGTERM", onSigTerm);
-          resolve(0);
+          finish(0);
           return;
         }
         if (code === 0) {
           const clean = filterTransientNoise(stderrLines);
           stderrLines.length = 0;
           flushBufferedStderr(clean);
-          process.off("SIGINT", onSigInt);
-          process.off("SIGTERM", onSigTerm);
-          resolve(0);
+          finish(0);
           return;
         }
 
         // Terminal (non-quota) exit: release everything the turn buffered.
         flushBufferedStderr(stderrLines);
-        process.off("SIGINT", onSigInt);
-        process.off("SIGTERM", onSigTerm);
-        resolve(code ?? 0);
+        finish(code ?? 0);
       });
     }
 
     async function handleRelaunch(
+      failedAttempt: CandidateAttempt,
       reason: string,
-      failedProfile: string,
-      failedPool: string,
       errorDetails?: string,
       rawErrorLine?: string,
-      bufferedStderr: string[] = [],
       triggerWasTerminal = false
     ) {
       if (isRelaunching) return;
+      // Lifecycle isolation (issue #74): only the live attempt may trigger
+      // failover. Signals from retired or superseded attempts are dropped.
+      if (failedAttempt.retired || !isCurrentAttempt(failedAttempt)) return;
+
+      // Strict quota attribution (issue #74): the cooldown lock is recorded
+      // ONLY against the candidate that physically emitted the error. These
+      // bindings are captured by value from the failed attempt and never
+      // follow the supervisor's mutable currentProfile/currentPool.
+      const failedProfile = failedAttempt.profile;
+      const failedPool = failedAttempt.pool;
+      const bufferedStderr = failedAttempt.stderrLines;
 
       // Snapshot the interrupted turn before any async work (issue #69). A
       // turn that already streamed output can never be replayed without
@@ -670,10 +896,11 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       const abortedTurnOpen = (lastUserMessage !== null || turnHadOutput) && !turnAborted;
 
       // When the quota signal arrived as the engine's own terminal `result`
-      // frame, forward it verbatim: downstream already has turn finality and
-      // failover below only warms the replacement for the *next* turn. This
-      // must never be swallowed — swallowing the terminal frame is the wedge.
-      if (triggerWasTerminal && rawErrorLine) {
+      // frame and the turn already had output, forward it verbatim: downstream
+      // already has partial output and downstream finality is needed.
+      // If the turn had NO output, we do NOT forward it here so the turn can
+      // be seamlessly replayed into the replacement child.
+      if (triggerWasTerminal && rawErrorLine && abortedHadOutput) {
         try {
           process.stdout.write(rawErrorLine + "\n");
         } catch {}
@@ -686,7 +913,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
       /** Close the interrupted turn exactly once when the engine never did. */
       const abortInterruptedTurn = (fromProf: string, fromP: string, toProf: string, toP: string, failedOver = true): void => {
-        if (turnAborted || triggerWasTerminal) return;
+        if (turnAborted || (triggerWasTerminal && abortedHadOutput)) return;
         // Only turns that produced output need synthetic finality: a
         // pre-output turn is replayed verbatim into the replacement child.
         if (!abortedHadOutput) return;
@@ -703,12 +930,24 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         turnHadOutput = false;
       };
 
-      const durSec = parseResetDurationSeconds(errorDetails || "");
+      const isHookError = isNonInferenceHookError(errorDetails || reason);
+      const parsedSec = parseResetDurationSeconds(errorDetails || "");
+      // Non-inference background hooks (like context summarization) should not lock
+      // model pools for 50 hours when Google emits generic reset banners.
+      const durSec = isHookError ? Math.min(parsedSec, 60) : parsedSec;
       logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails} (cooldown: ${durSec}s)`);
       if (durSec > 0) {
         recordCooldownFamily(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
       }
       triedCandidates.add(candidateKey(failedProfile, failedPool));
+
+      // Retire the failed attempt BEFORE any async work: from this point on,
+      // every late close/error/stderr/stdout event from the dying child is
+      // dropped by the isolation guards instead of being evaluated as the
+      // replacement candidate. This also closes the re-entrancy window while
+      // selectProfile is awaited below.
+      failedAttempt.retire(killedChildPids);
+      isRelaunching = true;
 
 
       // Check if a healthy fallback exists in the policy-ordered candidate
@@ -729,37 +968,80 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       } catch (err) {
         // Failover could not be scheduled: the failure is terminal, so the raw
         // buffered stderr must reach the caller — plus an explicit abort frame
-        // when the engine never closed the active turn (issue #69).
+        // or raw error line when the engine closed the active turn.
         flushBufferedStderr(bufferedStderr);
-        logMuxMessage("SUPERVISOR", `Failover failed: ${(err as Error)?.message ?? String(err)}`);
-        isRelaunching = true;
-        if (child) {
-          if (child.pid) killedChildPids.add(child.pid);
-          killChildTree(child);
+        if (triggerWasTerminal && rawErrorLine && !abortedHadOutput) {
+          try {
+            process.stdout.write(rawErrorLine + "\n");
+          } catch {}
         }
+        logMuxMessage("SUPERVISOR", `Failover failed: ${(err as Error)?.message ?? String(err)}`);
         abortInterruptedTurn(failedProfile, failedPool, failedProfile, failedPool, false);
-        process.off("SIGINT", onSigInt);
-        process.off("SIGTERM", onSigTerm);
-        resolve(1);
+        finish(1);
         return;
       }
 
-      // If all candidates are in cooldown, selectProfile returns the one with
-      // the shortest remaining cooldown (bestCandidate). Proceed with that
-      // candidate rather than aborting — it will become healthy soonest.
-      // The triedCandidates.has check is redundant because selectProfile
-      // already excludes tried candidates via the excludeCandidates parameter.
-      if (decision.allCooldown) {
+      // Halt on exhaustion (issue #74): when the policy matrix has no healthy
+      // candidate left AND the router's pick was already failed during this
+      // turn, the full matrix is exhausted — HALT and abort the turn with a
+      // clean final error frame. Never cycle between already-failed
+      // candidates within the same turn (no ping-pong loop). A cooled-but-
+      // untried candidate (stale lock from an earlier session) is still given
+      // one attempt below.
+      if (decision.allCooldown && triedCandidates.has(candidateKey(decision.profile, decision.pool))) {
         // Failover is not clean here, so keep the raw quota output visible.
         flushBufferedStderr(bufferedStderr);
-        logMuxMessage("SUPERVISOR", `All candidates for requested pool '${targetPool}' in cooldown; failing over to shortest cooldown: ${decision.profile} (pool: ${decision.pool}, ${decision.reason})`);
+        if (triggerWasTerminal && rawErrorLine && !abortedHadOutput) {
+          // Pre-output terminal error with no fallback: forward it so the
+          // turn still terminates downstream.
+          try {
+            process.stdout.write(rawErrorLine + "\n");
+          } catch {}
+          lastUserMessage = null;
+          turnSurfaced = false;
+          turnMessagePrefixed = false;
+          turnHadOutput = false;
+          turnAborted = true;
+        } else {
+          // Non-terminal trigger (error frame / crash) with no fallback:
+          // the orphaned turn needs explicit finality even when it produced
+          // no output yet, otherwise downstream waits forever.
+          const turnOpen = (lastUserMessage !== null || abortedHadOutput) && !turnAborted;
+          if (turnOpen && !abortedHadOutput) {
+            try {
+              process.stdout.write(
+                buildTurnAbortFrame(conversationId, failedProfile, failedPool, failedProfile, failedPool, reason, false) + "\n"
+              );
+            } catch {}
+            turnAborted = true;
+            lastUserMessage = null;
+            turnSurfaced = false;
+            turnMessagePrefixed = false;
+            turnHadOutput = false;
+          } else {
+            abortInterruptedTurn(failedProfile, failedPool, failedProfile, failedPool, false);
+          }
+        }
+        logMuxMessage("SUPERVISOR", `All candidates exhausted this turn (tried: ${Array.from(triedCandidates).join(", ")}); halting without further failover`);
+        process.stderr.write(
+          `\n[agent-mux] ${reason} on ${failedProfile} (pool: ${failedPool}). No healthy fallback profile is available; the turn cannot continue.\n`
+        );
+        finish(1);
+        return;
+      }
+
+      // selectProfile returned a cooled-but-untried candidate (stale lock from
+      // an earlier session): give it one attempt. Failover is not clean here,
+      // so keep the raw quota output visible.
+      if (decision.allCooldown) {
+        flushBufferedStderr(bufferedStderr);
+        logMuxMessage("SUPERVISOR", `All healthy candidates for requested pool '${targetPool}' in cooldown; failing over to shortest cooldown: ${decision.profile} (pool: ${decision.pool}, ${decision.reason})`);
       } else {
         // Recovered automatically: drop the failed candidate's raw stderr so
         // the caller never sees a transient quota banner.
         bufferedStderr.length = 0;
       }
 
-      isRelaunching = true;
       relaunchCount++;
 
       const prevProf = failedProfile;
@@ -785,12 +1067,10 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         `\n[agent-mux] ${reason} on ${prevProf} (pool: ${prevPool}). Automatically switching to healthy profile: ${nextProf} (pool: ${nextPool})...\n`
       );
 
-      // Kill the previous child tree (process group, issue #69): SIGTERM only
-      // the direct PID leaks grandchildren holding inherited stdio fds.
-      if (child) {
-        if (child.pid) killedChildPids.add(child.pid);
-        killChildTree(child);
-      }
+      // The failed attempt was already retired (and its tree killed) before
+      // selectProfile ran, so its late events cannot leak into the
+      // replacement. The replacement launches with a completely clean
+      // stderr buffer and freshly resolved environment (issue #74).
 
       currentProfile = nextProf;
       currentPool = nextPool;
@@ -804,10 +1084,8 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       // downstream finalizes the killed turn even if the new child idles.
       abortInterruptedTurn(prevProf, prevPool, nextProf, nextPool);
 
-      const newSpawn = spawnChild(currentProfile);
-      const newChild = newSpawn.proc;
-      child = newChild;
-      activeChildStderr = newSpawn.stderrLines;
+      const newAttempt = spawnAttempt(nextProf, nextPool);
+      const newChild = newAttempt.proc;
 
       let initConsumed = false;
       const rl = readline.createInterface({ input: newChild.stdout! });
@@ -839,19 +1117,23 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         if (replacementDead) {
           // No healthy child left to serve the session: close any still-open
           // turn explicitly, then exit instead of hanging on stdout.
-          if ((lastUserMessage !== null || turnHadOutput) && !turnAborted && !triggerWasTerminal) {
+          // Only the live attempt may settle the session: a superseded
+          // attempt dying here must stay silent (issue #74).
+          if (!isCurrentAttempt(newAttempt)) return;
+          if ((lastUserMessage !== null || turnHadOutput) && !turnAborted && !(triggerWasTerminal && abortedHadOutput)) {
             abortInterruptedTurn(prevProf, prevPool, nextProf, nextPool);
           }
-          flushBufferedStderr(newSpawn.stderrLines);
-          process.off("SIGINT", onSigInt);
-          process.off("SIGTERM", onSigTerm);
-          resolve(code ?? 1);
+          flushBufferedStderr(newAttempt.stderrLines);
+          finish(code ?? 1);
         }
       };
       newChild.once("close", (code) => settleInit(true, code));
       newChild.once("error", () => settleInit(true, null));
 
       rl.on("line", (line) => {
+        // Only the live replacement may consume init: lines from any other
+        // attempt generation are dropped.
+        if (!isCurrentAttempt(newAttempt)) return;
         if (!initConsumed) {
           try {
             const frame = JSON.parse(line);
@@ -868,7 +1150,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               }
 
               // Hook normal stdout listener
-              attachStdoutListener(newChild, newSpawn.stderrLines, currentProfile, currentPool);
+              attachStdoutListener(newAttempt);
               return;
             }
           } catch {}
@@ -876,6 +1158,6 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
       });
     }
 
-    attachStdoutListener(child!, activeChildStderr, currentProfile, currentPool);
+    attachStdoutListener(initialAttempt);
   });
 }

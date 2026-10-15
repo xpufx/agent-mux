@@ -616,6 +616,52 @@ test("pre-output quota failover replays seamlessly with no abort frame (issue #6
   assert.equal(results[0].result?.status, "SUCCESS", "replayed turn must succeed on the fallback");
 });
 
+test("pre-output quota result error frame replays seamlessly without forwarding error frame", async () => {
+  const caseHome = makeCaseHome("preoutput-result-error-replay");
+  const childPath = writeChild(
+    caseHome,
+    `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+      `if (profileName === "alice") {\n` +
+      `  const rl = readline.createInterface({ input: process.stdin });\n` +
+      `  rl.on("line", (line) => {\n` +
+      `    try {\n` +
+      `      const d = JSON.parse(line);\n` +
+      // Antigravity emits a terminal result ERROR frame even before any output
+      `      if (d.event === "user") {\n` +
+      `        console.log(JSON.stringify({ event: "result", result: { status: "ERROR", error: "Individual quota reached. Resets in 38h." } }));\n` +
+      `        setTimeout(() => process.exit(0), 100);\n` +
+      `      }\n` +
+      `    } catch {}\n` +
+      `  });\n` +
+      `} else {\n` +
+      `  const rl = readline.createInterface({ input: process.stdin });\n` +
+      `  rl.on("line", (line) => {\n` +
+      `    try {\n` +
+      `      const d = JSON.parse(line);\n` +
+      `      if (d.event === "user") {\n` +
+      `        console.log(JSON.stringify({ event: "step_update", step_update: { step_type: "agent_response", text_delta: "hello from bob" } }));\n` +
+      `        console.log(JSON.stringify({ event: "result", result: { status: "SUCCESS" } }));\n` +
+      `      }\n` +
+      `    } catch {}\n` +
+      `  });\n` +
+      `}\n`
+  );
+  const { driverPath } = writeDriver(caseHome, childPath);
+
+  const { code, stdout } = await runDriverStaggered(driverPath, caseHome, {
+    writes: [{ atMs: 0, line: USER_1 }],
+    endAtMs: 2500
+  });
+
+  assert.equal(code, 0, `driver must exit cleanly (stdout=${stdout.slice(-400)})`);
+  const frames = parseNdjson(stdout);
+  const errorResults = frames.filter((f) => f.event === "result" && f.result?.status === "ERROR");
+  assert.equal(errorResults.length, 0, `pre-output result ERROR must not be forwarded upstream when healthy fallback exists, got: ${stdout.slice(-500)}`);
+  const successResults = frames.filter((f) => f.event === "result" && f.result?.status === "SUCCESS");
+  assert.equal(successResults.length, 1, `turn must succeed seamlessly on bob, got: ${stdout.slice(-500)}`);
+});
+
+
 test("buildTurnAbortFrame shapes a namespaced ERROR terminal frame", async () => {
   const { buildTurnAbortFrame } = await import("../dist/index.js");
   const frame = JSON.parse(
@@ -655,3 +701,368 @@ test("getKillGraceMs honors AGENT_MUX_KILL_GRACE_MS override", async () => {
     else process.env.AGENT_MUX_KILL_GRACE_MS = saved;
   }
 });
+
+test("isNonInferenceHookError detects background lifecycle hook errors", async () => {
+  const { isNonInferenceHookError } = await import("../dist/index.js");
+  assert.ok(
+    isNonInferenceHookError(
+      "agent executor error: pre-invocation hook: context summarization: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 47h3m47s."
+    )
+  );
+  assert.ok(isNonInferenceHookError("Failed to poll fetchAvailableModels: rate limit exceeded"));
+  assert.ok(!isNonInferenceHookError("RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 47h3m47s."));
+  assert.ok(!isNonInferenceHookError("quota exceeded for model gemini-3.8-flash-low"));
+});
+
+test("supervisor auto-heals / clears active cooldown upon successful turn", async () => {
+  const { recordCooldown, checkCooldown } = await import("../dist/index.js");
+  const caseHome = makeCaseHome("auto-heal-cooldown");
+
+  // Pre-seed an active cooldown for alice
+  const savedHome = process.env.AGENT_MUX_HOME;
+  try {
+    process.env.AGENT_MUX_HOME = caseHome;
+    recordCooldown("antigravity", "alice", "gemini", 3600, "stale limit");
+    assert.equal(checkCooldown("antigravity", "alice", "gemini").cooling, true, "precondition: must be cooling");
+
+    const childPath = writeChild(
+      caseHome,
+      `const rl = readline.createInterface({ input: process.stdin });\n` +
+        `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+        `rl.on("line", () => {\n` +
+        `  console.log(JSON.stringify({ event: "step_update", step_update: { step_type: "agent_response", text_delta: "ok" } }));\n` +
+        `  console.log(JSON.stringify({ event: "result", result: { status: "SUCCESS" } }));\n` +
+        `  setTimeout(() => process.exit(0), 100);\n` +
+        `});\n`
+    );
+    const { driverPath } = writeDriver(caseHome, childPath);
+    const { code } = await runDriver(driverPath, caseHome, {
+      stdin: true,
+      inputLines: [JSON.stringify({ event: "user", text: "hello" })]
+    });
+
+    assert.equal(code, 0, "turn should exit cleanly");
+    const check = checkCooldown("antigravity", "alice", "gemini");
+    assert.equal(check.cooling, false, "active cooldown must be cleared on successful turn");
+  } finally {
+    if (savedHome === undefined) delete process.env.AGENT_MUX_HOME;
+    else process.env.AGENT_MUX_HOME = savedHome;
+  }
+});
+
+test("supervisor caps cooldown duration to 60s for non-inference hook 429 errors", async () => {
+  const { checkCooldown } = await import("../dist/index.js");
+  const caseHome = makeCaseHome("cap-hook-cooldown");
+  const hookError =
+    "agent executor error: pre-invocation hook: context summarization: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 47h3m47s.";
+
+  const childPath = writeChild(
+    caseHome,
+    `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+      `if (profileName === "alice") {\n` +
+      `  console.error(${JSON.stringify(hookError)});\n` +
+      `  process.exit(1);\n` +
+      `} else {\n` +
+      `  setTimeout(() => console.log(JSON.stringify({ event: "result", result: { status: "SUCCESS" } })), 100);\n` +
+      `  setTimeout(() => process.exit(0), 200);\n` +
+      `}\n`
+  );
+  const { driverPath } = writeDriver(caseHome, childPath);
+
+  const savedHome = process.env.AGENT_MUX_HOME;
+  try {
+    process.env.AGENT_MUX_HOME = caseHome;
+    const { code } = await runDriver(driverPath, caseHome);
+    assert.equal(code, 0, "failover to bob should succeed");
+
+    const cd = checkCooldown("antigravity", "alice", "gemini");
+    assert.equal(cd.cooling, true, "alice should have cooldown recorded");
+    assert.ok(
+      cd.remainingSec <= 60,
+      `hook cooldown duration must be capped at <= 60s, got: ${cd.remainingSec}s`
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.AGENT_MUX_HOME;
+    else process.env.AGENT_MUX_HOME = savedHome;
+  }
+});
+
+// --- Candidate lifecycle isolation regression tests (issue #74) ---
+//
+// Per-candidate attempts own their stderr buffers, readline interfaces and
+// exit listeners. A dying attempt's late events must never be evaluated as,
+// or attribute quota to, the replacement candidate. Full-matrix exhaustion
+// halts with a clean abort frame instead of ping-ponging, and cooldowns
+// clear only via probe verification or verified turn completion.
+
+function countOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  return haystack.split(needle).length - 1;
+}
+
+// Driver variant with an artificially slow quota status check: it widens the
+// async window between quota-frame detection and replacement selection, so a
+// dying attempt's concurrent close/stderr events deterministically land while
+// failover is in flight.
+function writeSlowDriver(caseDir, childPath, quotaDelayMs) {
+  const driverPath = path.join(caseDir, "driver.mjs");
+  fs.writeFileSync(
+    driverPath,
+    `const { runSupervisor } = await import(${JSON.stringify(distIndexPath)});\n` +
+      `import path from "node:path";\n` +
+      `const caseDir = ${JSON.stringify(caseDir)};\n` +
+      `const childPath = ${JSON.stringify(childPath)};\n` +
+      `const delayMs = ${JSON.stringify(quotaDelayMs)};\n` +
+      `const profilesBaseDir = path.join(caseDir, "profiles", "antigravity");\n` +
+      `const adapter = {\n` +
+      `  id: "antigravity",\n` +
+      `  displayName: "Google Antigravity",\n` +
+      `  binaryName: "agy",\n` +
+      `  defaultBinaryPath: process.execPath,\n` +
+      `  profilesBaseDir,\n` +
+      `  resolveTargetPool: () => "gemini",\n` +
+      `  getSupportedPools: () => ["gemini", "claude"],\n` +
+      `  getPoolModel: (pool) => (pool === "claude" ? "claude-test" : "gemini-test"),\n` +
+      `  getSharedPaths: () => [],\n` +
+      `  getAuthStatus: async () => true,\n` +
+      `  getAccountIdentity: async (p) => p + "@example.com",\n` +
+      `  getQuotaStatus: async () => {\n` +
+      `    await new Promise((r) => setTimeout(r, delayMs));\n` +
+      `    return [\n` +
+      `      { pool: "gemini", state: "READY" },\n` +
+      `      { pool: "claude", state: "READY" }\n` +
+      `    ];\n` +
+      `  }\n` +
+      `};\n` +
+      `const code = await runSupervisor({\n` +
+      `  adapter,\n` +
+      `  initialProfile: "alice",\n` +
+      `  initialPool: "gemini",\n` +
+      `  binaryPath: process.execPath,\n` +
+      `  args: [childPath],\n` +
+      `  env: { ...process.env },\n` +
+      `  surfaceAccount: "none"\n` +
+      `});\n` +
+      `process.exit(code);\n`
+  );
+  return driverPath;
+}
+
+test("issue #74: dying attempt's concurrent close/stderr triggers exactly one failover and never cools the fallback", async () => {
+  const caseHome = makeCaseHome("74-single-failover");
+  const childPath = writeChild(
+    caseHome,
+    `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+      `if (profileName === "alice") {\n` +
+      `  const rl = readline.createInterface({ input: process.stdin });\n` +
+      `  rl.on("line", (line) => {\n` +
+      `    try {\n` +
+      `      const d = JSON.parse(line);\n` +
+      `      if (d.event === "user") {\n` +
+      // Frame signal AND crash signal race: the stdout quota frame starts
+      // failover while the immediate non-zero exit lands mid-flight.
+      `        console.log(JSON.stringify({ event: "error", error: ${JSON.stringify(QUOTA_ERROR)} }));\n` +
+      `        console.error(${JSON.stringify(QUOTA_ERROR)});\n` +
+      `        setTimeout(() => process.exit(1), 20);\n` +
+      `      }\n` +
+      `    } catch {}\n` +
+      `  });\n` +
+      BOB_SERVE_ONCE
+  );
+  // Slow quota status keeps the failover window open while alice dies.
+  const driverPath = writeSlowDriver(caseHome, childPath, 400);
+
+  const { code, stdout, stderr } = await runDriverStaggered(driverPath, caseHome, {
+    writes: [{ atMs: 0, line: USER_1 }],
+    endAtMs: 3000
+  });
+
+  assert.equal(code, 0, `driver must exit cleanly (stderr=${stderr.slice(-400)})`);
+  assert.equal(
+    countOccurrences(stderr, "Automatically switching to healthy profile: bob"),
+    1,
+    `dying attempt must cause exactly one failover, got stderr: ${stderr.slice(-600)}`
+  );
+  assert.ok(stdout.includes("SUCCESS"), `replacement must serve the replayed turn, got: ${stdout.slice(-400)}`);
+  assert.ok(
+    !stderr.includes("Quota exceeded for gemini pool"),
+    `recovered quota stderr must stay suppressed, got: ${stderr.slice(-300)}`
+  );
+
+  const savedHome = process.env.AGENT_MUX_HOME;
+  try {
+    process.env.AGENT_MUX_HOME = caseHome;
+    const { checkCooldown } = await import("../dist/index.js");
+    assert.equal(
+      checkCooldown("antigravity", "alice", "gemini").cooling,
+      true,
+      "emitting candidate alice must carry the cooldown"
+    );
+    assert.equal(
+      checkCooldown("antigravity", "bob", "gemini").cooling,
+      false,
+      "fallback candidate bob must NEVER inherit alice's quota lock"
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.AGENT_MUX_HOME;
+    else process.env.AGENT_MUX_HOME = savedHome;
+  }
+});
+
+test("issue #74: full matrix exhaustion halts with a clean abort frame (no ping-pong)", async () => {
+  const caseHome = makeCaseHome("74-exhaustion-halt");
+  const childPath = writeChild(
+    caseHome,
+    `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+      `const rl = readline.createInterface({ input: process.stdin });\n` +
+      `rl.on("line", (line) => {\n` +
+      `  try {\n` +
+      `    const d = JSON.parse(line);\n` +
+      // Every candidate fails the same turn with 429 before any output.
+      `    if (d.event === "user") {\n` +
+      `      console.log(JSON.stringify({ event: "error", error: ${JSON.stringify(QUOTA_ERROR)} }));\n` +
+      `    }\n` +
+      `  } catch {}\n` +
+      `});\n`
+  );
+  const { driverPath } = writeDriver(caseHome, childPath);
+
+  const { code, stdout, stderr } = await runDriverStaggered(driverPath, caseHome, {
+    writes: [{ atMs: 0, line: USER_1 }],
+    endAtMs: 3000,
+    timeoutMs: 20000
+  });
+
+  assert.equal(code, 1, `exhausted matrix must halt with code 1 (stdout=${stdout.slice(-400)} stderr=${stderr.slice(-400)})`);
+  assert.equal(
+    countOccurrences(stderr, "Automatically switching to healthy profile"),
+    1,
+    `exactly one failover (alice->bob) before halting; no ping-pong, got: ${stderr.slice(-600)}`
+  );
+  assert.ok(
+    stderr.includes("No healthy fallback"),
+    `halt must report no healthy fallback, got: ${stderr.slice(-400)}`
+  );
+  const frames = parseNdjson(stdout);
+  const aborts = frames.filter((f) => f.agent_mux_failover_abort);
+  assert.equal(aborts.length, 1, `halt must emit exactly one terminal abort frame, got: ${stdout.slice(-500)}`);
+  assert.equal(aborts[0].event, "result", "halt abort must be a terminal result frame");
+  assert.equal(aborts[0].result?.status, "ERROR", "halt abort must never fabricate success");
+  assert.equal(
+    aborts[0].agent_mux_failover_abort?.to,
+    null,
+    `halt abort must carry no fallback target, got: ${JSON.stringify(aborts[0])}`
+  );
+  assert.ok(
+    !stdout.includes("SUCCESS"),
+    `no candidate serves the turn, got: ${stdout.slice(-400)}`
+  );
+
+  const savedHome = process.env.AGENT_MUX_HOME;
+  try {
+    process.env.AGENT_MUX_HOME = caseHome;
+    const { checkCooldown } = await import("../dist/index.js");
+    assert.equal(
+      checkCooldown("antigravity", "alice", "gemini").cooling,
+      true,
+      "alice keeps its own emitted cooldown"
+    );
+    assert.equal(
+      checkCooldown("antigravity", "bob", "gemini").cooling,
+      true,
+      "bob keeps its own emitted cooldown"
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.AGENT_MUX_HOME;
+    else process.env.AGENT_MUX_HOME = savedHome;
+  }
+});
+
+test("issue #74: probe READY clears a long cooldown, LIMIT re-records it", async () => {
+  const { recordCooldown, checkCooldown, verifyCooldownWithProbe, LONG_COOLDOWN_THRESHOLD_SEC } =
+    await import("../dist/index.js");
+  assert.equal(LONG_COOLDOWN_THRESHOLD_SEC, 300, "long-cooldown threshold must be 300s");
+
+  const savedHome = process.env.AGENT_MUX_HOME;
+  const caseHome = makeCaseHome("74-probe-clear");
+  try {
+    process.env.AGENT_MUX_HOME = caseHome;
+    // 36h genuine quota exhaustion.
+    recordCooldown("antigravity", "alice", "gemini", 36 * 3600, "Individual quota reached. Resets in 36h.");
+    assert.equal(checkCooldown("antigravity", "alice", "gemini").cooling, true, "precondition: long lock active");
+
+    const readyAdapter = {
+      id: "antigravity",
+      probe: async () => ({ state: "READY", details: "quota restored" })
+    };
+    const cleared = await verifyCooldownWithProbe(readyAdapter, "alice", "gemini");
+    assert.equal(cleared.cleared, true, "READY probe must report clearing");
+    assert.equal(
+      checkCooldown("antigravity", "alice", "gemini").cooling,
+      false,
+      "READY probe must clear even a 36h lock"
+    );
+
+    const limitAdapter = {
+      id: "antigravity",
+      probe: async () => ({ state: "LIMIT", details: "Quota exceeded. Resets in 2h." })
+    };
+    const stillLimited = await verifyCooldownWithProbe(limitAdapter, "bob", "gemini");
+    assert.equal(stillLimited.cleared, false, "LIMIT probe must not clear");
+    const cd = checkCooldown("antigravity", "bob", "gemini");
+    assert.equal(cd.cooling, true, "LIMIT probe must record the lock against the probed candidate");
+    assert.ok(cd.remainingSec > 300, `LIMIT duration must be honored, got ${cd.remainingSec}s`);
+
+    const noProbeAdapter = { id: "antigravity" };
+    recordCooldown("antigravity", "alice", "claude", 3600, "seed");
+    const untouched = await verifyCooldownWithProbe(noProbeAdapter, "alice", "claude");
+    assert.equal(untouched.cleared, false, "provider without probe leaves locks untouched");
+    assert.equal(checkCooldown("antigravity", "alice", "claude").cooling, true);
+  } finally {
+    if (savedHome === undefined) delete process.env.AGENT_MUX_HOME;
+    else process.env.AGENT_MUX_HOME = savedHome;
+  }
+});
+
+test("issue #74: step_update and bare exit-0 never clear a long cooldown (probe/verified-turn only)", async () => {
+  const caseHome = makeCaseHome("74-no-stepupdate-clear");
+  const savedHome = process.env.AGENT_MUX_HOME;
+  try {
+    process.env.AGENT_MUX_HOME = caseHome;
+    const { recordCooldown, checkCooldown } = await import("../dist/index.js");
+    // Genuine 1h quota exhaustion on alice.
+    recordCooldown("antigravity", "alice", "gemini", 3600, "Quota exceeded. Resets in 1h.");
+
+    const childPath = writeChild(
+      caseHome,
+      `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+        `const rl = readline.createInterface({ input: process.stdin });\n` +
+        `rl.on("line", () => {\n` +
+        // Superficial stream output with NO terminal SUCCESS frame.
+        `  console.log(JSON.stringify({ event: "step_update", step_update: { step_type: "agent_response", text_delta: "partial" } }));\n` +
+        `  setTimeout(() => process.exit(0), 150);\n` +
+        `});\n`
+    );
+    const { driverPath } = writeDriver(caseHome, childPath);
+    const { code, stderr } = await runDriver(driverPath, caseHome, {
+      stdin: true,
+      inputLines: [JSON.stringify({ event: "user", text: "hello" })]
+    });
+
+    assert.equal(code, 0, `driver exit (stderr=${stderr.slice(-300)})`);
+    assert.equal(
+      checkCooldown("antigravity", "alice", "gemini").cooling,
+      true,
+      "long cooldown must survive step_update + bare exit-0; only probe or SUCCESS clears it"
+    );
+    assert.ok(
+      !stderr.includes("Automatically switching"),
+      `no failover expected, got: ${stderr.slice(-300)}`
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.AGENT_MUX_HOME;
+    else process.env.AGENT_MUX_HOME = savedHome;
+  }
+});
+
+
