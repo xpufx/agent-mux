@@ -192,6 +192,56 @@ test("supervisor suppresses buffered quota stderr on successful failover", async
   assert.ok(stdout.includes("SUCCESS"), `bob's successful result should pass through, got: ${stdout}`);
 });
 
+test("issue #76: synthetic and diagnostic quota result frames do not fail over", async () => {
+  const caseHome = makeCaseHome("76-synthetic");
+  const savedHome = process.env.AGENT_MUX_HOME;
+  try {
+    process.env.AGENT_MUX_HOME = caseHome;
+    const childPath = writeChild(
+      caseHome,
+      `console.log(JSON.stringify({ event: "init", conversation_id: "test-conv" }));\n` +
+        `const rl = readline.createInterface({ input: process.stdin });\n` +
+        `rl.on("line", (line) => {\n` +
+        `  try {\n` +
+        `    if (JSON.parse(line).event === "user") {\n` +
+        `      console.log(JSON.stringify({ event: "result", result: { status: "ERROR", error: "[agent-mux] Turn aborted mid-stream: quota exceeded" }, agent_mux_failover_abort: { from: "alice", to: "bob" } }));\n` +
+        `      console.log(JSON.stringify({ event: "result", result: { status: "ERROR", error: "diagnostic: quota exceeded while rendering prior output" } }));\n` +
+        `      console.log(JSON.stringify({ event: "result", result: { status: "SUCCESS" } }));\n` +
+        `      setTimeout(() => process.exit(0), 100);\n` +
+        `    }\n` +
+        `  } catch {}\n` +
+        `});\n`
+    );
+    const { driverPath } = writeDriver(caseHome, childPath);
+    const { code, stdout, stderr } = await runDriver(driverPath, caseHome, {
+      stdin: true,
+      inputLines: [JSON.stringify({ event: "user", text: "hello" })]
+    });
+
+    assert.equal(code, 0, `healthy candidate must finish (stdout=${stdout} stderr=${stderr})`);
+    assert.equal(
+      (stderr.match(/Automatically switching to healthy profile/g) || []).length,
+      0,
+      `synthetic/diagnostic quota text must not trigger failover: ${stderr}`
+    );
+    const { checkCooldown } = await import("../dist/index.js");
+    assert.equal(
+      checkCooldown("antigravity", "alice", "gemini").cooling,
+      false,
+      "running candidate must not receive a quota cooldown"
+    );
+    assert.equal(
+      checkCooldown("antigravity", "bob", "gemini").cooling,
+      false,
+      "unused fallback candidate must remain unlocked"
+    );
+    assert.ok(stdout.includes("SUCCESS"), `native success frame should pass through: ${stdout}`);
+  } finally {
+    if (savedHome === undefined) delete process.env.AGENT_MUX_HOME;
+    else process.env.AGENT_MUX_HOME = savedHome;
+  }
+});
+
 test("supervisor flushes buffered stderr on non-quota crash", async () => {
   const caseHome = makeCaseHome("flush-crash");
   const childPath = writeChild(
@@ -1064,5 +1114,4 @@ test("issue #74: step_update and bare exit-0 never clear a long cooldown (probe/
     else process.env.AGENT_MUX_HOME = savedHome;
   }
 });
-
 

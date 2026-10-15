@@ -93,6 +93,38 @@ export function isQuotaError(text: unknown): boolean {
   return isHardQuotaError(text) || isCapacityError(text);
 }
 
+/**
+ * A terminal quota result must come from the engine's native error payload.
+ * agent-mux emits result/ERROR frames for interrupted turns too; their
+ * diagnostic text is not evidence that the replacement candidate is limited.
+ */
+export function isNativeEngineQuotaResult(frame: unknown): boolean {
+  if (!frame || typeof frame !== "object") return false;
+  const candidate = frame as Record<string, unknown>;
+  if (candidate.event !== "result" || candidate.agent_mux_failover_abort) return false;
+  const result = candidate.result;
+  if (!result || typeof result !== "object") return false;
+  const payload = result as Record<string, unknown>;
+  if (payload.status !== "ERROR" || !("error" in payload)) return false;
+  const error = payload.error;
+  if (typeof error !== "string" && (typeof error !== "object" || error === null)) {
+    return false;
+  }
+  const text = errorTextOf(error).toLowerCase();
+  const nativeStringShape =
+    typeof error !== "string" ||
+    /^(?:error\s+429\b|resource[_ ]exhausted\b|quota exceeded\b|individual quota reached\b|rate limit\b|rate_limit\b)/i.test(
+      error.trim()
+    );
+  return (
+    !text.includes("agent-mux") &&
+    !text.includes("failover_abort") &&
+    !text.includes("diagnostic") &&
+    nativeStringShape &&
+    isQuotaError(error)
+  );
+}
+
 export function isProcessCrashQuotaError(stderrLines: string[]): string | undefined {
   // Same vocabulary as live-frame detection: any quota signal on stderr
   // during an active turn means the crash was a quota failure.
@@ -739,7 +771,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
 
           if (eventType === "result") {
             const res = parsedFrame.result || {};
-            if (res.status === "ERROR" && isQuotaError(res.error)) {
+            if (isNativeEngineQuotaResult(parsedFrame)) {
               quotaDetected = true;
               // Only treat as terminal (forwarded) if turn already had output.
               // If turn had NO output, we can replay seamlessly to the fallback child
