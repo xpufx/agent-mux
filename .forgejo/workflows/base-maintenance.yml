@@ -39,7 +39,9 @@ jobs:
     name: Report maintenance failure
     needs: [sync-labels]
     if: ${{ always() && needs.sync-labels.result == 'failure' }}
-    runs-on: runner-local-shell
+    runs-on: ubuntu-24.04
+    container:
+      image: forge.mrs.uppidi.com/oktay/runner-containers/ubuntu-podman-builder:latest
     permissions:
       issues: write
     steps:
