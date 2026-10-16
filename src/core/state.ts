@@ -154,7 +154,7 @@ export function checkCooldown(
   provider: string,
   profile: string,
   pool: string
-): { cooling: boolean; remainingSec?: number; resetAt?: number; reason?: string } {
+): { cooling: boolean; remainingSec?: number; resetAt?: number; recordedAt?: number; reason?: string } {
   const cooldowns = loadCooldowns();
   const key = makeCooldownKey(provider, profile, pool);
   const entry = cooldowns[key];
@@ -171,6 +171,7 @@ export function checkCooldown(
     cooling: true,
     remainingSec,
     resetAt: entry.resetAt,
+    recordedAt: entry.recordedAt,
     reason: entry.reason
   };
 }

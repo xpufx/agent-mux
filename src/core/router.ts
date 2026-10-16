@@ -3,8 +3,13 @@ import path from "node:path";
 import type { ProviderAdapter, PoolQuota, RoutingDecision } from "../types.js";
 import { listProfiles } from "./profiles.js";
 import { getAgentMuxHome } from "./paths.js";
-import { checkCooldown, logMuxMessage } from "./state.js";
+import { checkCooldown, clearCooldown, logMuxMessage } from "./state.js";
+import { recordCooldownFamily } from "./pools.js";
+import { parseResetDurationSeconds } from "./cooldown.js";
 import { getRoutingPolicy, type RoutingPolicy } from "./config.js";
+
+/** Minimum elapsed seconds since a cooldown was recorded before opportunistically probing again */
+export const PROBE_RECHECK_THRESHOLD_SEC = 30;
 
 export interface CandidateStatus {
   profile: string;
@@ -150,17 +155,47 @@ export async function selectProfile(
   for (const { profile: prof, pool } of order) {
     if (excluded.has(candidateKey(prof, pool))) continue;
 
-    // Persisted cooldowns always gate selection: provider:profile:pool.
+    // Persisted cooldowns gate selection: provider:profile:pool.
     const cd = checkCooldown(adapter.id, prof, pool);
     if (cd.cooling) {
-      candidates.push({
-        profile: prof,
-        pool,
-        isHealthy: false,
-        remainingSec: cd.remainingSec ?? 3600,
-        reason: `Active cooldown (${cd.remainingSec}s remaining)`
-      });
-      continue;
+      // Opportunistic Probe: if adapter supports probe and cooldown is eligible for re-check, probe it.
+      const now = Date.now();
+      const recordedAt = cd.recordedAt ?? (cd.resetAt ? cd.resetAt - (cd.remainingSec ?? 0) * 1000 : 0);
+      const elapsedSec = (now - recordedAt) / 1000;
+      let recovered = false;
+
+      if (adapter.probe && elapsedSec >= PROBE_RECHECK_THRESHOLD_SEC) {
+        try {
+          const probeRes = await adapter.probe(prof, pool);
+          if (probeRes.state === "READY") {
+            clearCooldown(adapter.id, prof, pool);
+            recovered = true;
+            logMuxMessage(
+              "ROUTER",
+              `Opportunistic probe recovered cooled candidate ${prof}/${pool}: READY (cleared cooldown)`
+            );
+          } else if (probeRes.state === "LIMIT") {
+            recordCooldownFamily(
+              adapter.id,
+              prof,
+              pool,
+              parseResetDurationSeconds(probeRes.details),
+              probeRes.details
+            );
+          }
+        } catch {}
+      }
+
+      if (!recovered) {
+        candidates.push({
+          profile: prof,
+          pool,
+          isHealthy: false,
+          remainingSec: cd.remainingSec ?? 3600,
+          reason: `Active cooldown (${cd.remainingSec}s remaining)`
+        });
+        continue;
+      }
     }
 
     let quotas = quotaCache.get(prof);
@@ -260,6 +295,41 @@ export async function selectProfile(
 
   candidates.sort((a, b) => a.remainingSec - b.remainingSec);
   const bestCandidate = candidates[0];
+
+  // All-Cooldown Fallback Probe: before selecting shortest wait candidate, probe it if adapter.probe exists
+  if (adapter.probe) {
+    try {
+      const probeRes = await adapter.probe(bestCandidate.profile, bestCandidate.pool);
+      if (probeRes.state === "READY") {
+        clearCooldown(adapter.id, bestCandidate.profile, bestCandidate.pool);
+        logMuxMessage(
+          "ROUTER",
+          `All-cooldown probe recovered shortest wait candidate ${bestCandidate.profile}/${bestCandidate.pool}: READY`
+        );
+        const recoveredDecision = {
+          profile: bestCandidate.profile,
+          targetPool,
+          pool: bestCandidate.pool,
+          reason: `Recovered via all-cooldown fallback probe (READY)`
+        };
+        if (onSelect) onSelect(recoveredDecision);
+        else
+          logMuxMessage(
+            "ROUTER",
+            `Selected ${recoveredDecision.profile}/${recoveredDecision.pool} for pool ${targetPool} [${policy}] (${recoveredDecision.reason})`
+          );
+        return recoveredDecision;
+      } else if (probeRes.state === "LIMIT") {
+        recordCooldownFamily(
+          adapter.id,
+          bestCandidate.profile,
+          bestCandidate.pool,
+          parseResetDurationSeconds(probeRes.details),
+          probeRes.details
+        );
+      }
+    } catch {}
+  }
 
   const decision = {
     profile: bestCandidate.profile,

@@ -8,6 +8,13 @@ import { parseResetDurationSeconds } from "./cooldown.js";
 import { loadConfig, saveConfig, getIsolationMode, type IsolationMode } from "./config.js";
 import type { ProviderAdapter, ProfileStatus } from "../types.js";
 
+export const STATUS_PROBE_CACHE_TTL_MS = 30_000;
+const statusProbeCache = new Map<string, number>();
+
+export function clearStatusProbeCache(): void {
+  statusProbeCache.clear();
+}
+
 /**
  * Persisted profile registry entry. Directory presence under
  * `<agent-mux-home>/profiles/<provider>/<name>` remains authoritative for
@@ -349,22 +356,37 @@ export async function getProviderStatus(
       : undefined;
     const pools = await adapter.getQuotaStatus(prof);
 
-    // Live probe is opt-in (e.g. status --probe). By default status is instant (<10ms)
-    // and relies on persisted cooldown timestamps which auto-clear upon expiry.
-    if (options.probe && adapter.probe) {
+    // Live probe is opt-in (e.g. status --probe) or opportunistic with a cache TTL (30s)
+    // for cooling pools that have been in cooldown for at least PROBE_RECHECK_THRESHOLD_SEC (30s)
+    // so status reflects live availability rather than stale timestamps.
+    const shouldProbeAny = options.probe;
+    if (adapter.probe) {
       for (const p of pools) {
-        if (!checkCooldown(adapter.id, prof, p.pool).cooling) continue;
-        const probe = await adapter.probe(prof, p.pool);
-        if (probe.state === "READY") {
-          clearCooldown(adapter.id, prof, p.pool);
-        } else if (probe.state === "LIMIT") {
-          recordCooldownFamily(
-            adapter.id,
-            prof,
-            p.pool,
-            parseResetDurationSeconds(probe.details),
-            probe.details
-          );
+        const cd = checkCooldown(adapter.id, prof, p.pool);
+        if (!cd.cooling) continue;
+
+        const now = Date.now();
+        const recordedAt = cd.recordedAt ?? (cd.resetAt ? cd.resetAt - (cd.remainingSec ?? 0) * 1000 : now);
+        const cooldownElapsedSec = (now - recordedAt) / 1000;
+        const cacheKey = `${adapter.id}:${prof}:${p.pool}`;
+        const lastProbe = statusProbeCache.get(cacheKey) ?? 0;
+        const probeCacheExpired = (now - lastProbe >= STATUS_PROBE_CACHE_TTL_MS);
+        const eligibleForProbe = shouldProbeAny || (cooldownElapsedSec >= 30 && probeCacheExpired);
+
+        if (eligibleForProbe) {
+          statusProbeCache.set(cacheKey, now);
+          const probe = await adapter.probe(prof, p.pool);
+          if (probe.state === "READY") {
+            clearCooldown(adapter.id, prof, p.pool);
+          } else if (probe.state === "LIMIT") {
+            recordCooldownFamily(
+              adapter.id,
+              prof,
+              p.pool,
+              parseResetDurationSeconds(probe.details),
+              probe.details
+            );
+          }
         }
       }
     }
