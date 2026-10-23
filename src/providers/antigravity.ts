@@ -103,6 +103,37 @@ function parseDurationSeconds(dStr: string): number {
   return total;
 }
 
+export function cleanupAgyProbeArtifacts(conversationId: string, roots: string[]): void {
+  if (!conversationId || typeof conversationId !== "string" || !/^[A-Za-z0-9_-]+$/.test(conversationId)) {
+    return;
+  }
+  for (const root of roots) {
+    if (!root) continue;
+    const geminiDir = path.join(root, ".gemini/antigravity-cli");
+    const convDir = path.join(geminiDir, "conversations");
+    const extensions = [".db", ".db-wal", ".db-shm", ".pbtxt", ".lock"];
+    for (const ext of extensions) {
+      try {
+        fs.rmSync(path.join(convDir, `${conversationId}${ext}`), { force: true });
+      } catch {}
+    }
+    const brainDir = path.join(geminiDir, "brain", conversationId);
+    try {
+      fs.rmSync(brainDir, { recursive: true, force: true });
+    } catch {}
+
+    const summaryDb = path.join(geminiDir, "conversation_summaries.db");
+    if (fs.existsSync(summaryDb)) {
+      try {
+        spawnSync("sqlite3", [
+          summaryDb,
+          `DELETE FROM conversation_summaries WHERE conversation_id = '${conversationId.replace(/'/g, "''")}';`
+        ]);
+      } catch {}
+    }
+  }
+}
+
 export class AntigravityAdapter implements ProviderAdapter {
   id = "antigravity";
   displayName = "Google Antigravity";
@@ -263,6 +294,7 @@ export class AntigravityAdapter implements ProviderAdapter {
   ): Promise<{ state: QuotaState; details: string }> {
     const profDir = path.join(this.profilesBaseDir, profile);
     const model = pool === "claude" ? "claude-sonnet-5-5-low" : "gemini-3.8-flash-low";
+    let conversationId: string | undefined;
 
     try {
       const child = spawnSync(
@@ -291,6 +323,26 @@ export class AntigravityAdapter implements ProviderAdapter {
         }
       );
 
+      const stdout = child.stdout || "";
+      const stderr = child.stderr || "";
+
+      // Extract conversation_id if present in stdout/stderr to clean up probe conversation artifacts
+      for (const line of stdout.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const f = JSON.parse(line);
+          if (!conversationId && (f.conversation_id || f.session_id)) {
+            conversationId = f.conversation_id || f.session_id;
+          }
+        } catch {}
+      }
+      if (!conversationId) {
+        const uuidMatch = `${stdout} ${stderr}`.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+        if (uuidMatch) {
+          conversationId = uuidMatch[0];
+        }
+      }
+
       if (child.error) {
         if ((child.error as any).code === "ETIMEDOUT") {
           return { state: "UNKNOWN", details: "Probe timed out (20s)" };
@@ -298,14 +350,14 @@ export class AntigravityAdapter implements ProviderAdapter {
         return { state: "UNKNOWN", details: child.error.message };
       }
 
-      const combined = `${child.stdout || ""} ${child.stderr || ""}`;
+      const combined = `${stdout} ${stderr}`;
       if (isQuotaError(combined)) {
         const m = combined.match(/Resets in [^\.]+/);
         return { state: "LIMIT", details: m ? m[0] : "Quota limit reached" };
       }
 
       // Check NDJSON output for result
-      for (const line of (child.stdout || "").split("\n")) {
+      for (const line of stdout.split("\n")) {
         if (!line.trim()) continue;
         try {
           const f = JSON.parse(line);
@@ -330,6 +382,10 @@ export class AntigravityAdapter implements ProviderAdapter {
       return { state: "UNKNOWN", details: `Process exited with code ${child.status}` };
     } catch (err: any) {
       return { state: "UNKNOWN", details: err.message || "Probe failed" };
+    } finally {
+      if (conversationId) {
+        cleanupAgyProbeArtifacts(conversationId, [profDir, getRealHome(), process.env.HOME || ""]);
+      }
     }
   }
 

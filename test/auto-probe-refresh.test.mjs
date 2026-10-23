@@ -15,10 +15,11 @@ const {
   selectProfile,
   getProviderStatus,
   clearStatusProbeCache,
-  isNativeEngineQuotaResult
+  isNativeEngineQuotaResult,
+  cleanupAgyProbeArtifacts
 } = await import("../dist/index.js");
 
-test("Opportunistic Probe - recovers eligible cooling profile when READY", async () => {
+test("selectProfile - never opportunistically probes cooling candidate and routes to healthy candidate (zero probe calls)", async () => {
   let probeCalls = 0;
   const fakeAdapter = {
     id: "test-adapter-auto",
@@ -30,51 +31,6 @@ test("Opportunistic Probe - recovers eligible cooling profile when READY", async
     getSharedPaths: () => [],
     getAuthStatus: async () => true,
     getQuotaStatus: async () => [{ pool: "claude", state: "READY" }],
-    probe: async (prof, pool) => {
-      probeCalls++;
-      if (prof === "p1") {
-        return { state: "READY", details: "Quota restored" };
-      }
-      return { state: "LIMIT", details: "Quota limit reached" };
-    }
-  };
-
-  fs.mkdirSync(path.join(fakeAdapter.profilesBaseDir, "p1"), { recursive: true });
-  fs.mkdirSync(path.join(fakeAdapter.profilesBaseDir, "p2"), { recursive: true });
-
-  // Record a cooldown on p1 with recordedAt 60 seconds in the past (> 30s threshold)
-  const entry = recordCooldown(fakeAdapter.id, "p1", "claude", 3600, "Old 429 lock");
-  assert.ok(entry);
-  // Backdate recordedAt
-  const { loadCooldowns, saveCooldowns } = await import("../dist/index.js");
-  const cds = loadCooldowns();
-  const key = `${fakeAdapter.id}:p1:claude`;
-  cds[key].recordedAt = Date.now() - 60_000;
-  saveCooldowns(cds);
-
-  assert.equal(checkCooldown(fakeAdapter.id, "p1", "claude").cooling, true);
-
-  // Router should opportunistically probe p1, see READY, clear cooldown, and select p1!
-  const decision = await selectProfile(fakeAdapter, [], {}, "auto");
-  assert.equal(decision.profile, "p1");
-  assert.equal(decision.pool, "claude");
-  assert.equal(decision.allCooldown, undefined);
-  assert.equal(checkCooldown(fakeAdapter.id, "p1", "claude").cooling, false);
-  assert.ok(probeCalls >= 1, "adapter.probe must be called");
-});
-
-test("Opportunistic Probe - respects eligibility threshold (< 30s elapsed skips probe)", async () => {
-  let probeCalls = 0;
-  const fakeAdapter = {
-    id: "test-adapter-fresh",
-    displayName: "Fresh Cooldown Adapter",
-    binaryName: "test-bin",
-    defaultBinaryPath: "/bin/true",
-    profilesBaseDir: path.join(tmpHome, "profiles", "test-adapter-fresh"),
-    resolveTargetPool: () => "claude",
-    getSharedPaths: () => [],
-    getAuthStatus: async () => true,
-    getQuotaStatus: async () => [{ pool: "claude", state: "READY" }],
     probe: async () => {
       probeCalls++;
       return { state: "READY", details: "Quota restored" };
@@ -84,18 +40,28 @@ test("Opportunistic Probe - respects eligibility threshold (< 30s elapsed skips 
   fs.mkdirSync(path.join(fakeAdapter.profilesBaseDir, "p1"), { recursive: true });
   fs.mkdirSync(path.join(fakeAdapter.profilesBaseDir, "p2"), { recursive: true });
 
-  // Fresh cooldown recorded right now (< 30s elapsed)
-  recordCooldown(fakeAdapter.id, "p1", "claude", 3600, "Fresh 429");
+  // Record a cooldown on p1 with recordedAt 60 seconds in the past
+  const entry = recordCooldown(fakeAdapter.id, "p1", "claude", 3600, "Old 429 lock");
+  assert.ok(entry);
+  const { loadCooldowns, saveCooldowns } = await import("../dist/index.js");
+  const cds = loadCooldowns();
+  const key = `${fakeAdapter.id}:p1:claude`;
+  cds[key].recordedAt = Date.now() - 60_000;
+  saveCooldowns(cds);
 
-  // Router should skip probing fresh p1, and select healthy p2
+  assert.equal(checkCooldown(fakeAdapter.id, "p1", "claude").cooling, true);
+
+  // Router must not opportunistically probe p1; it must route to healthy p2 with zero probes
   const decision = await selectProfile(fakeAdapter, [], {}, "auto");
   assert.equal(decision.profile, "p2");
-  assert.equal(probeCalls, 0, "fresh cooldown must not trigger probe immediately");
+  assert.equal(decision.pool, "claude");
+  assert.equal(decision.allCooldown, undefined);
+  assert.equal(probeCalls, 0, "selectProfile must make zero probe calls");
   assert.equal(checkCooldown(fakeAdapter.id, "p1", "claude").cooling, true);
 });
 
-test("All-Cooldown Fallback Probe - recovers shortest wait candidate when READY", async () => {
-  let probedProfile = "";
+test("selectProfile - all-cooldown fallback selects shortest wait with allCooldown:true without probing", async () => {
+  let probeCalls = 0;
   const fakeAdapter = {
     id: "test-adapter-all-cd",
     displayName: "All CD Adapter",
@@ -106,8 +72,8 @@ test("All-Cooldown Fallback Probe - recovers shortest wait candidate when READY"
     getSharedPaths: () => [],
     getAuthStatus: async () => true,
     getQuotaStatus: async () => [{ pool: "claude", state: "READY" }],
-    probe: async (prof, pool) => {
-      probedProfile = prof;
+    probe: async () => {
+      probeCalls++;
       return { state: "READY", details: "Quota reset early" };
     }
   };
@@ -119,24 +85,23 @@ test("All-Cooldown Fallback Probe - recovers shortest wait candidate when READY"
   recordCooldown(fakeAdapter.id, "p1", "claude", 300, "Shorter cooldown");
   recordCooldown(fakeAdapter.id, "p2", "claude", 3600, "Longer cooldown");
 
-  // All candidates in cooldown -> router probes shortest wait (p1), recovers it, and routes cleanly without allCooldown flag!
+  // All candidates in cooldown -> router selects shortest wait (p1) with allCooldown: true without probing
   const decision = await selectProfile(fakeAdapter, [], {}, "auto");
-  assert.equal(probedProfile, "p1");
   assert.equal(decision.profile, "p1");
-  assert.equal(decision.allCooldown, undefined);
-  assert.ok(decision.reason.includes("Recovered via all-cooldown fallback probe"));
-  assert.equal(checkCooldown(fakeAdapter.id, "p1", "claude").cooling, false);
+  assert.equal(decision.allCooldown, true);
+  assert.equal(probeCalls, 0, "all-cooldown fallback must not execute synthetic probe turns");
+  assert.equal(checkCooldown(fakeAdapter.id, "p1", "claude").cooling, true);
 });
 
-test("Status consistency - auto-probe refreshes stale cooldowns older than 30s and updates to READY", async () => {
+test("getProviderStatus - 100% offline by default (zero probes even on stale cooldowns)", async () => {
   clearStatusProbeCache();
   let probeCalls = 0;
   const fakeAdapter = {
-    id: "test-adapter-status",
-    displayName: "Status Adapter",
+    id: "test-adapter-status-offline",
+    displayName: "Status Offline Adapter",
     binaryName: "test-bin",
     defaultBinaryPath: "/bin/true",
-    profilesBaseDir: path.join(tmpHome, "profiles", "test-adapter-status"),
+    profilesBaseDir: path.join(tmpHome, "profiles", "test-adapter-status-offline"),
     getAuthStatus: async () => true,
     getAccountIdentity: async () => "status-user@example.com",
     getQuotaStatus: async () => [{ pool: "gemini", state: "READY" }],
@@ -148,26 +113,83 @@ test("Status consistency - auto-probe refreshes stale cooldowns older than 30s a
 
   fs.mkdirSync(path.join(fakeAdapter.profilesBaseDir, "user1"), { recursive: true });
 
-  // Record a cooldown on user1
+  // Record a cooldown on user1 backdated by 40s
   recordCooldown(fakeAdapter.id, "user1", "gemini", 1800, "Old lock");
-  // Backdate recordedAt by 40s
   const { loadCooldowns, saveCooldowns } = await import("../dist/index.js");
   const cds = loadCooldowns();
   const key = `${fakeAdapter.id}:user1:gemini`;
   cds[key].recordedAt = Date.now() - 40_000;
   saveCooldowns(cds);
 
-  // First status check: auto-probes eligible cooling candidate, sees READY, clears cooldown
-  const status1 = await getProviderStatus(fakeAdapter);
-  const pool1 = status1[0].pools.find((p) => p.pool === "gemini");
-  assert.equal(pool1.state, "READY");
-  assert.equal(probeCalls, 1);
-  assert.equal(checkCooldown(fakeAdapter.id, "user1", "gemini").cooling, false);
+  // Status check without options.probe must make 0 probe calls and show LIMIT
+  const status = await getProviderStatus(fakeAdapter);
+  const pool = status[0].pools.find((p) => p.pool === "gemini");
+  assert.equal(pool.state, "LIMIT");
+  assert.equal(probeCalls, 0, "default status check must be 100% offline");
+  assert.equal(checkCooldown(fakeAdapter.id, "user1", "gemini").cooling, true);
+});
 
-  // Subsequent status check is consistent and remains READY
-  const status2 = await getProviderStatus(fakeAdapter);
-  const pool2 = status2[0].pools.find((p) => p.pool === "gemini");
-  assert.equal(pool2.state, "READY");
+test("getProviderStatus - opt-in { probe: true } runs live probe and clears cooldown on READY", async () => {
+  let probeCalls = 0;
+  const fakeAdapter = {
+    id: "test-adapter-status-optin",
+    displayName: "Status Optin Adapter",
+    binaryName: "test-bin",
+    defaultBinaryPath: "/bin/true",
+    profilesBaseDir: path.join(tmpHome, "profiles", "test-adapter-status-optin"),
+    getAuthStatus: async () => true,
+    getAccountIdentity: async () => "status-user@example.com",
+    getQuotaStatus: async () => [{ pool: "gemini", state: "READY" }],
+    probe: async () => {
+      probeCalls++;
+      return { state: "READY", details: "Quota restored" };
+    }
+  };
+
+  fs.mkdirSync(path.join(fakeAdapter.profilesBaseDir, "user1"), { recursive: true });
+  recordCooldown(fakeAdapter.id, "user1", "gemini", 1800, "Active lock");
+
+  // Calling with { probe: true } must run the live probe
+  const status = await getProviderStatus(fakeAdapter, { probe: true });
+  const pool = status[0].pools.find((p) => p.pool === "gemini");
+  assert.equal(pool.state, "READY");
+  assert.equal(probeCalls, 1, "explicit probe option must invoke adapter.probe");
+  assert.equal(checkCooldown(fakeAdapter.id, "user1", "gemini").cooling, false);
+});
+
+test("cleanupAgyProbeArtifacts - deletes conversations db files and brain directory", () => {
+  const mockHome = path.join(tmpHome, "cleanup-test-home");
+  const geminiDir = path.join(mockHome, ".gemini", "antigravity-cli");
+  const convDir = path.join(geminiDir, "conversations");
+  const brainDir = path.join(geminiDir, "brain", "conv-uuid-1234");
+  fs.mkdirSync(convDir, { recursive: true });
+  fs.mkdirSync(brainDir, { recursive: true });
+
+  const files = [
+    path.join(convDir, "conv-uuid-1234.db"),
+    path.join(convDir, "conv-uuid-1234.db-wal"),
+    path.join(convDir, "conv-uuid-1234.db-shm"),
+    path.join(convDir, "conv-uuid-1234.lock"),
+    path.join(convDir, "conv-uuid-1234.pbtxt"),
+    path.join(brainDir, "transcript.jsonl")
+  ];
+  for (const f of files) {
+    fs.writeFileSync(f, "mock-data");
+  }
+
+  // Preconditions: files exist
+  for (const f of files) {
+    assert.equal(fs.existsSync(f), true, `${f} must exist initially`);
+  }
+  assert.equal(fs.existsSync(brainDir), true);
+
+  cleanupAgyProbeArtifacts("conv-uuid-1234", [mockHome]);
+
+  // All probe artifacts must be cleaned up
+  for (const f of files) {
+    assert.equal(fs.existsSync(f), false, `${f} must be deleted`);
+  }
+  assert.equal(fs.existsSync(brainDir), false, "brain directory must be deleted");
 });
 
 test("Native Frame Isolation - echoed quota strings in text deltas / tools do not trigger quota detection", () => {
