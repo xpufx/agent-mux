@@ -24,6 +24,7 @@ export interface ProfileRecord {
   provider: string;
   name: string;
   createdAt?: string;
+  pools?: string[];
 }
 
 export interface ProfileInfo {
@@ -84,8 +85,91 @@ function isProfileRecord(value: unknown): value is ProfileRecord {
 /** Load the profile registry from the global config file. */
 export function getRegisteredProfiles(provider?: string): ProfileRecord[] {
   const records = loadConfig().profiles;
-  const list = Array.isArray(records) ? records.filter(isProfileRecord) : [];
+  const list: ProfileRecord[] = [];
+  if (Array.isArray(records)) {
+    list.push(...records.filter(isProfileRecord));
+  } else if (records && typeof records === "object") {
+    for (const [prov, profs] of Object.entries(records)) {
+      if (profs && typeof profs === "object") {
+        for (const [name, val] of Object.entries(profs)) {
+          const rec: ProfileRecord = { provider: prov, name };
+          if (val && typeof val === "object" && "pools" in val && Array.isArray((val as any).pools)) {
+            rec.pools = (val as any).pools;
+          } else if (Array.isArray(val)) {
+            rec.pools = val;
+          }
+          list.push(rec);
+        }
+      }
+    }
+  }
   return provider ? list.filter((r) => r.provider === provider) : list;
+}
+
+/**
+ * Returns the list of pools configured for a profile, or undefined if no pool
+ * restrictions are configured.
+ */
+export function getProfileSupportedPools(
+  provider: string,
+  profile: string,
+  adapter?: ProviderAdapter,
+  configOverride?: ReturnType<typeof loadConfig>
+): string[] | undefined {
+  const config = configOverride ?? loadConfig();
+  let declared: string[] | undefined;
+
+  // 1. Check array format in config.profiles
+  if (Array.isArray(config.profiles)) {
+    const rec = config.profiles.find(
+      (r) => isProfileRecord(r) && r.provider === provider && r.name === profile
+    );
+    if (rec && Array.isArray(rec.pools)) {
+      declared = rec.pools;
+    }
+  } else if (config.profiles && typeof config.profiles === "object") {
+    // 2. Check dictionary format: config.profiles[provider][profile]
+    const provProfiles = (config.profiles as Record<string, unknown>)[provider];
+    if (provProfiles && typeof provProfiles === "object") {
+      const profEntry = (provProfiles as Record<string, unknown>)[profile];
+      if (profEntry && typeof profEntry === "object") {
+        if ("pools" in profEntry && Array.isArray((profEntry as any).pools)) {
+          declared = (profEntry as any).pools;
+        }
+      } else if (Array.isArray(profEntry)) {
+        declared = profEntry;
+      }
+    }
+  }
+
+  if (!declared) return undefined;
+
+  // Normalize pool names if adapter has a normalizer
+  if (adapter?.normalizePool) {
+    return declared.map((p) => adapter.normalizePool!(p));
+  }
+  return declared;
+}
+
+/**
+ * Checks whether a profile is entitled/allowed to handle a given pool.
+ * If no pools are configured for the profile, returns true (all pools allowed).
+ */
+export function isProfileEntitledForPool(
+  adapter: ProviderAdapter,
+  profile: string,
+  pool: string,
+  configOverride?: ReturnType<typeof loadConfig>
+): boolean {
+  const normalizedPool = adapter.normalizePool ? adapter.normalizePool(pool) : pool;
+  const configured = getProfileSupportedPools(adapter.id, profile, adapter, configOverride);
+  if (!configured) {
+    return true; // No restrictions configured: profile supports all adapter pools
+  }
+  return configured.some((p) => {
+    const norm = adapter.normalizePool ? adapter.normalizePool(p) : p;
+    return norm === normalizedPool;
+  });
 }
 
 function saveRegisteredProfiles(records: ProfileRecord[]): void {

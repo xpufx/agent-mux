@@ -10,8 +10,10 @@ export type RoutingPolicy = "pool-strict" | "pool-spillover" | "account-first";
 export interface AgentMuxConfig {
   surface_account?: SurfaceAccountMode;
   routingPolicy?: RoutingPolicy;
-  /** Registry of profiles created through the CLI (directory presence is still authoritative). */
-  profiles?: ProfileRecord[];
+  /** Registry of profiles created through the CLI or configured with pool entitlements. */
+  profiles?:
+    | ProfileRecord[]
+    | Record<string, Record<string, { pools?: string[] } | string[]>>;
   [key: string]: unknown;
 }
 

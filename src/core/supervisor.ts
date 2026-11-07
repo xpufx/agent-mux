@@ -13,9 +13,9 @@ import {
 import { logMuxMessage, clearCooldown } from "./state.js";
 import { recordCooldownFamily } from "./pools.js";
 import { selectProfile, candidateKey, applyPoolModel, hasExplicitModelArg } from "./router.js";
-import { parseResetDurationSeconds, isCapacityError } from "./cooldown.js";
+import { parseResetDurationSeconds, isCapacityError, isEntitlementError } from "./cooldown.js";
 
-export { parseResetDurationSeconds, isCapacityError } from "./cooldown.js";
+export { parseResetDurationSeconds, isCapacityError, isEntitlementError } from "./cooldown.js";
 
 /**
  * Extract readable text from a stream error payload. Engine frames may carry
@@ -125,11 +125,41 @@ export function isNativeEngineQuotaResult(frame: unknown): boolean {
   );
 }
 
+export function isNativeEngineEntitlementResult(frame: unknown): boolean {
+  if (!frame || typeof frame !== "object") return false;
+  const candidate = frame as Record<string, unknown>;
+  if (candidate.event !== "result" || candidate.agent_mux_failover_abort) return false;
+  const result = candidate.result;
+  if (!result || typeof result !== "object") return false;
+  const payload = result as Record<string, unknown>;
+  if (payload.status !== "ERROR" || !("error" in payload)) return false;
+  const error = payload.error;
+  if (typeof error !== "string" && (typeof error !== "object" || error === null)) {
+    return false;
+  }
+  const text = errorTextOf(error).toLowerCase();
+  return (
+    !text.includes("agent-mux") &&
+    !text.includes("failover_abort") &&
+    !text.includes("diagnostic") &&
+    isEntitlementError(error)
+  );
+}
+
 export function isProcessCrashQuotaError(stderrLines: string[]): string | undefined {
   // Same vocabulary as live-frame detection: any quota signal on stderr
   // during an active turn means the crash was a quota failure.
   for (const line of stderrLines) {
     if (isQuotaError(line)) {
+      return line;
+    }
+  }
+  return undefined;
+}
+
+export function isProcessCrashEntitlementError(stderrLines: string[]): string | undefined {
+  for (const line of stderrLines) {
+    if (isEntitlementError(line)) {
       return line;
     }
   }
@@ -588,6 +618,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
   const selectionLogger = createCandidateSelectionLogger();
   let isRelaunching = false;
   let relaunchCount = 0;
+  const sessionEntitlementExclusions = new Set<string>();
   const triedCandidates = new Set<string>([candidateKey(currentProfile, currentPool)]);
 
   // Turn state
@@ -667,6 +698,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         turnAborted = false;
         relaunchCount = 0;
         triedCandidates.clear();
+        for (const k of sessionEntitlementExclusions) triedCandidates.add(k);
         triedCandidates.add(candidateKey(currentProfile, currentPool));
       }
     } catch {}
@@ -749,6 +781,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         let quotaTriggerWasTerminal = false;
         let parsedFrame: any = null;
         let errorDetails = "";
+        let relaunchReason = "Quota exhausted";
 
         try {
           parsedFrame = JSON.parse(line);
@@ -773,9 +806,15 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
             const res = parsedFrame.result || {};
             if (isNativeEngineQuotaResult(parsedFrame)) {
               quotaDetected = true;
+              relaunchReason = "Quota exhausted";
               // Only treat as terminal (forwarded) if turn already had output.
               // If turn had NO output, we can replay seamlessly to the fallback child
               // without surfacing the 429 result frame to the client.
+              quotaTriggerWasTerminal = turnHadOutput;
+              errorDetails = errorTextOf(res.error);
+            } else if (isNativeEngineEntitlementResult(parsedFrame)) {
+              quotaDetected = true;
+              relaunchReason = "Entitlement error";
               quotaTriggerWasTerminal = turnHadOutput;
               errorDetails = errorTextOf(res.error);
             } else {
@@ -794,17 +833,24 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
               failoverPrevProfile = null;
               relaunchCount = 0;
               triedCandidates.clear();
+              for (const k of sessionEntitlementExclusions) triedCandidates.add(k);
               triedCandidates.add(candidateKey(prof, pool));
               flushTurnStderr(stderrLines);
             }
-          } else if (eventType === "error" && isQuotaError(parsedFrame.error)) {
+          } else if (
+            eventType === "error" &&
+            (isQuotaError(parsedFrame.error) || isEntitlementError(parsedFrame.error))
+          ) {
             quotaDetected = true;
+            relaunchReason = isEntitlementError(parsedFrame.error)
+              ? "Entitlement error"
+              : "Quota exhausted";
             errorDetails = errorTextOf(parsedFrame.error);
           }
         } catch {}
 
         if (quotaDetected) {
-          await handleRelaunch(attempt, "Quota exhausted", errorDetails, line, quotaTriggerWasTerminal);
+          await handleRelaunch(attempt, relaunchReason, errorDetails, line, quotaTriggerWasTerminal);
           return;
         }
 
@@ -849,14 +895,19 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         if (isRelaunching) return;
         if (proc.pid && killedChildPids.has(proc.pid)) return;
 
-        // Check for quota error in stderr.
-        // A process may exit non-zero or exit without producing turn output due to quota.
+        // Check for quota or entitlement error in stderr.
+        // A process may exit non-zero or exit without producing turn output due to quota or entitlement.
         // However, if the turn succeeded (turnHadOutput) and exited 0, transient retry
         // warnings or non-fatal background hook notices are NOT crashes.
         const isCleanSuccess = (code === 0 || code === null) && turnHadOutput;
-        const crashLine = isProcessCrashQuotaError(stderrLines);
-        if (crashLine && !isCleanSuccess) {
-          await handleRelaunch(attempt, "Process exited with quota limit", crashLine, undefined);
+        const crashQuotaLine = isProcessCrashQuotaError(stderrLines);
+        const crashEntitlementLine = isProcessCrashEntitlementError(stderrLines);
+        if ((crashQuotaLine || crashEntitlementLine) && !isCleanSuccess) {
+          const crashLine = crashEntitlementLine || crashQuotaLine!;
+          const reason = crashEntitlementLine
+            ? "Process exited with entitlement error"
+            : "Process exited with quota limit";
+          await handleRelaunch(attempt, reason, crashLine, undefined);
           return;
         }
 
@@ -873,7 +924,7 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
           // quota reached" warnings from upstream gateways).
           const suppressed = new Set<string>();
           const clean = stderrLines.filter((chunk) => {
-            if (isQuotaError(chunk)) {
+            if (isQuotaError(chunk) || isEntitlementError(chunk)) {
               suppressed.add(chunk);
               return false;
             }
@@ -962,12 +1013,25 @@ export async function runSupervisor(options: SupervisorOptions): Promise<number>
         turnHadOutput = false;
       };
 
+      const isEntitlement = isEntitlementError(errorDetails || reason);
       const isHookError = isNonInferenceHookError(errorDetails || reason);
       const parsedSec = parseResetDurationSeconds(errorDetails || "");
+      // Entitlement errors (403, PERMISSION_DENIED) do not assign quota cooldowns to profiles.
       // Non-inference background hooks (like context summarization) should not lock
       // model pools for 50 hours when Google emits generic reset banners.
-      const durSec = isHookError ? Math.min(parsedSec, 60) : parsedSec;
-      logMuxMessage("SUPERVISOR", `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails} (cooldown: ${durSec}s)`);
+      const durSec = isEntitlement ? 0 : isHookError ? Math.min(parsedSec, 60) : parsedSec;
+      if (isEntitlement) {
+        logMuxMessage(
+          "SUPERVISOR",
+          `Entitlement error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails} (no cooldown recorded)`
+        );
+        sessionEntitlementExclusions.add(candidateKey(failedProfile, failedPool));
+      } else {
+        logMuxMessage(
+          "SUPERVISOR",
+          `Quota error detected on profile '${failedProfile}' (pool: '${failedPool}'): ${reason} | details: ${errorDetails} (cooldown: ${durSec}s)`
+        );
+      }
       if (durSec > 0) {
         recordCooldownFamily(adapter.id, failedProfile, failedPool, durSec, errorDetails || reason);
       }

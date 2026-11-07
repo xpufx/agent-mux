@@ -151,13 +151,21 @@ export class AntigravityAdapter implements ProviderAdapter {
   }
 
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string {
-    if (env.AGY_TARGET_POOL === "claude") return "claude";
-    if (env.AGY_TARGET_POOL === "gemini") return "gemini";
+    if (env.AGY_TARGET_POOL) {
+      const p = env.AGY_TARGET_POOL.toLowerCase();
+      if (p === "claude") return "claude";
+      if (p === "gemini") return "gemini";
+      if (p === "ultra" || p === "argon") return "ultra";
+    }
     let model = "";
     let prev = "";
     for (const a of args) {
       if (prev === "--model" || prev === "-m") {
         model = a;
+        break;
+      }
+      if (a.startsWith("--model=")) {
+        model = a.slice("--model=".length);
         break;
       }
       prev = a;
@@ -177,6 +185,9 @@ export class AntigravityAdapter implements ProviderAdapter {
     }
 
     const m = model.toLowerCase();
+    if (m.includes("argon") || m.includes("ultra")) {
+      return "ultra";
+    }
     if (m.startsWith("claude") || m.startsWith("gpt")) {
       return "claude";
     }
@@ -191,12 +202,18 @@ export class AntigravityAdapter implements ProviderAdapter {
   }
 
   getSupportedPools(): string[] {
-    return ["gemini", "claude"];
+    return ["gemini", "claude", "ultra"];
+  }
+
+  normalizePool(pool: string): string {
+    if (pool.toLowerCase() === "argon") return "ultra";
+    return pool;
   }
 
   getPoolModel(pool: string): string | undefined {
     if (pool === "claude") return "claude-sonnet-5-5-low";
     if (pool === "gemini") return "gemini-3.8-flash-low";
+    if (pool === "ultra" || pool === "argon") return "argon";
     return undefined;
   }
 
@@ -284,7 +301,8 @@ export class AntigravityAdapter implements ProviderAdapter {
     // and persisted cooldowns in ~/.agent-mux/state/cooldowns.json, eliminating disk log pollution.
     return [
       { pool: "gemini", state: "READY" },
-      { pool: "claude", state: "READY" }
+      { pool: "claude", state: "READY" },
+      { pool: "ultra", state: "READY" }
     ];
   }
 
@@ -293,7 +311,12 @@ export class AntigravityAdapter implements ProviderAdapter {
     pool: string
   ): Promise<{ state: QuotaState; details: string }> {
     const profDir = path.join(this.profilesBaseDir, profile);
-    const model = pool === "claude" ? "claude-sonnet-5-5-low" : "gemini-3.8-flash-low";
+    const model =
+      pool === "claude"
+        ? "claude-sonnet-5-5-low"
+        : pool === "ultra" || pool === "argon"
+        ? "argon"
+        : "gemini-3.8-flash-low";
     let conversationId: string | undefined;
 
     try {
@@ -396,7 +419,8 @@ export class AntigravityAdapter implements ProviderAdapter {
       "gemini-3.8-flash-low",
       "claude-sonnet-4-6",
       "claude-sonnet-5-5-low",
-      "claude-opus-4-6"
+      "claude-opus-4-6",
+      "argon"
     ];
   }
 

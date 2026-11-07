@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ProviderAdapter, PoolQuota, RoutingDecision } from "../types.js";
-import { listProfiles } from "./profiles.js";
+import { listProfiles, isProfileEntitledForPool, getProfileSupportedPools } from "./profiles.js";
 import { getAgentMuxHome } from "./paths.js";
 import { checkCooldown, clearCooldown, logMuxMessage } from "./state.js";
 import { recordCooldownFamily } from "./pools.js";
 import { parseResetDurationSeconds } from "./cooldown.js";
-import { getRoutingPolicy, type RoutingPolicy } from "./config.js";
+import { getRoutingPolicy, loadConfig, type RoutingPolicy } from "./config.js";
+
+export { isProfileEntitledForPool, getProfileSupportedPools };
 
 /** Minimum elapsed seconds since a cooldown was recorded before opportunistically probing again */
 export const PROBE_RECHECK_THRESHOLD_SEC = 30;
@@ -33,21 +35,28 @@ export function buildCandidateOrder(
   profiles: string[],
   targetPool: string,
   otherPools: string[],
-  policy: RoutingPolicy
+  policy: RoutingPolicy,
+  isEntitled?: (profile: string, pool: string) => boolean
 ): Array<{ profile: string; pool: string }> {
   const pools = [targetPool, ...otherPools];
   const order: Array<{ profile: string; pool: string }> = [];
 
+  const addCandidate = (profile: string, pool: string) => {
+    if (!isEntitled || isEntitled(profile, pool)) {
+      order.push({ profile, pool });
+    }
+  };
+
   if (policy === "pool-spillover") {
     for (const pool of pools) {
-      for (const profile of profiles) order.push({ profile, pool });
+      for (const profile of profiles) addCandidate(profile, pool);
     }
   } else if (policy === "account-first") {
     for (const profile of profiles) {
-      for (const pool of pools) order.push({ profile, pool });
+      for (const pool of pools) addCandidate(profile, pool);
     }
   } else {
-    for (const profile of profiles) order.push({ profile, pool: targetPool });
+    for (const profile of profiles) addCandidate(profile, targetPool);
   }
 
   return order;
@@ -109,22 +118,27 @@ export async function selectProfile(
   policy: RoutingPolicy = getRoutingPolicy(),
   poolOverride?: string,
   /** When provided, the caller owns the selection log (e.g. to dedupe it). */
-  onSelect?: (decision: RoutingDecision) => void
+  onSelect?: (decision: RoutingDecision) => void,
+  configOverride?: ReturnType<typeof loadConfig>
 ): Promise<RoutingDecision & { allCooldown?: boolean }> {
   const inferredPool = adapter.resolveTargetPool(args, env);
-  if (poolOverride !== undefined) {
+  let effectivePoolOverride = poolOverride;
+  if (effectivePoolOverride !== undefined && adapter.normalizePool) {
+    effectivePoolOverride = adapter.normalizePool(effectivePoolOverride);
+  }
+  if (effectivePoolOverride !== undefined) {
     let supported = adapter.getSupportedPools?.() ?? [];
-    if (!supported.includes(poolOverride) && adapter.discoverPools) {
+    if (!supported.includes(effectivePoolOverride) && adapter.discoverPools) {
       // Cold cache: discover dynamic (inner-provider) pools on demand.
       supported = await adapter.discoverPools();
     }
-    if (!supported.includes(poolOverride)) {
+    if (!supported.includes(effectivePoolOverride)) {
       throw new Error(
         `Unknown pool '${poolOverride}' for provider '${adapter.id}'. Available pools: ${supported.join(", ")}`
       );
     }
   }
-  const targetPool = poolOverride ?? inferredPool;
+  const targetPool = effectivePoolOverride ?? inferredPool;
   const allProfiles = listProfiles(adapter);
 
   if (allProfiles.length === 0) {
@@ -146,8 +160,14 @@ export async function selectProfile(
   }
 
   // 2. Build the policy-ordered candidate matrix and evaluate each `(profile, pool)`.
-  const otherPools = (adapter.getSupportedPools?.() ?? []).filter((p) => p !== targetPool);
-  const order = buildCandidateOrder(allProfiles, targetPool, otherPools, policy);
+  const isEntitled = (prof: string, pl: string) =>
+    isProfileEntitledForPool(adapter, prof, pl, configOverride);
+  const otherPools = (adapter.getSupportedPools?.() ?? []).filter((p) => {
+    const normP = adapter.normalizePool ? adapter.normalizePool(p) : p;
+    const normTarget = adapter.normalizePool ? adapter.normalizePool(targetPool) : targetPool;
+    return normP !== normTarget;
+  });
+  const order = buildCandidateOrder(allProfiles, targetPool, otherPools, policy, isEntitled);
   const excluded = new Set(excludeCandidates);
   const quotaCache = new Map<string, PoolQuota[]>();
   const candidates: CandidateStatus[] = [];
@@ -254,11 +274,16 @@ export async function selectProfile(
 
   // 4. Every candidate in the configured order is tried, cooled, or excluded: HALT.
   if (candidates.length === 0) {
+    const entitledProfiles = allProfiles.filter((p) => isEntitled(p, targetPool));
+    const reason =
+      entitledProfiles.length === 0
+        ? `No profiles entitled for pool '${targetPool}'`
+        : `All candidates already tried (policy: ${policy})`;
     return {
-      profile: allProfiles[0],
+      profile: entitledProfiles[0] || allProfiles[0],
       targetPool,
       pool: targetPool,
-      reason: `All candidates already tried (policy: ${policy})`,
+      reason,
       allCooldown: true
     };
   }

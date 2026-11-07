@@ -19,8 +19,36 @@ export function isCapacityError(text: unknown): boolean {
   );
 }
 
+export function isEntitlementError(text: unknown): boolean {
+  if (!text) return false;
+  let raw: string;
+  if (typeof text === "string") {
+    raw = text;
+  } else {
+    try {
+      raw = JSON.stringify(text) ?? "";
+    } catch {
+      raw = String(text);
+    }
+  }
+  const t = raw.toLowerCase();
+  return (
+    /\b403\b/.test(t) ||
+    t.includes("permission_denied") ||
+    t.includes("permission denied") ||
+    t.includes("model not available for tier") ||
+    t.includes("not available for your tier") ||
+    t.includes("not available for tier") ||
+    t.includes("not entitled") ||
+    t.includes("forbidden") ||
+    t.includes("insufficient tier") ||
+    t.includes("requires ultra") ||
+    t.includes("requires subscription tier")
+  );
+}
+
 export function parseResetDurationSeconds(text: string): number {
-  if (isCapacityError(text)) {
+  if (isCapacityError(text) || isEntitlementError(text)) {
     return 0;
   }
   const match = text.match(/Resets in\s+([^.\r\n]+)/i);

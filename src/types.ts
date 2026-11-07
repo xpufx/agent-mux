@@ -31,6 +31,7 @@ export interface ProviderAdapter {
   resolveTargetPool(args: string[], env: NodeJS.ProcessEnv): string;
   getSharedPaths(): string[];
   getSupportedPools(): string[];
+  normalizePool?(pool: string): string;
   getPoolModel?(pool: string): string | undefined;
   prepareExecution?(
     profile: string,
